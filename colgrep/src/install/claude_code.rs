@@ -21,11 +21,11 @@ const PLUGIN_JSON: &str = include_str!("plugin.json");
 const HOOK_JSON: &str = include_str!("hook.json");
 
 use super::SKILL_MD;
+use crate::index::paths::get_colgrep_base_dir;
 
 /// Get the marketplace directory path (in user's data directory)
 fn get_marketplace_dir() -> Result<PathBuf> {
-    let data_dir = dirs::data_dir().context("Could not determine data directory")?;
-    Ok(data_dir.join("colgrep").join("claude-marketplace"))
+    Ok(get_colgrep_base_dir()?.join("claude-marketplace"))
 }
 
 /// Create the full marketplace directory structure with all files

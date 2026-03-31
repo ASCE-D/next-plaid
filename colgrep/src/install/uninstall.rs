@@ -8,12 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::{uninstall_claude_code, uninstall_codex, uninstall_opencode};
-
-/// Get the colgrep data directory (contains indices and config)
-fn get_colgrep_data_dir() -> Result<PathBuf> {
-    let data_dir = dirs::data_dir().context("Could not determine data directory")?;
-    Ok(data_dir.join("colgrep"))
-}
+use crate::index::paths::get_colgrep_base_dir;
 
 /// Get the colgrep cache directory (contains ONNX runtime)
 fn get_colgrep_cache_dir() -> Result<PathBuf> {
@@ -106,7 +101,7 @@ fn uninstall_ai_tools() {
 
 /// Remove the colgrep data directory
 fn remove_data_directory() -> Result<()> {
-    let data_dir = get_colgrep_data_dir()?;
+    let data_dir = get_colgrep_base_dir()?;
 
     if data_dir.exists() {
         // Count indexes before removing

@@ -48,6 +48,9 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         "html" | "htm" => Some(Language::Html),
         "md" | "markdown" => Some(Language::Markdown),
         "txt" | "text" | "rst" => Some(Language::Text),
+        // Temporary fallback until real XML support exists: route XML/XAML-family
+        // documents through the same document-level text extraction as .txt.
+        "xml" | "xsd" | "xsl" | "xslt" | "xaml" => Some(Language::Text),
         "adoc" | "asciidoc" => Some(Language::AsciiDoc),
         "org" => Some(Language::Org),
         // Config formats
@@ -269,6 +272,18 @@ mod tests {
             detect_language(Path::new("package.json")),
             Some(Language::Json)
         );
+    }
+
+    #[test]
+    fn test_detect_language_xml_family_maps_to_text() {
+        assert_eq!(detect_language(Path::new("feed.xml")), Some(Language::Text));
+        assert_eq!(detect_language(Path::new("schema.xsd")), Some(Language::Text));
+        assert_eq!(detect_language(Path::new("transform.xsl")), Some(Language::Text));
+        assert_eq!(
+            detect_language(Path::new("templates/layout.xslt")),
+            Some(Language::Text)
+        );
+        assert_eq!(detect_language(Path::new("view.xaml")), Some(Language::Text));
     }
 
     #[test]

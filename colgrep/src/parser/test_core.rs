@@ -625,6 +625,23 @@ Some content here.
 }
 
 #[test]
+fn test_extract_xaml_document_as_text() {
+    let source = r#"<Window Title="MainWindow">
+  <Grid>
+    <TextBlock Text="Hello XAML" />
+  </Grid>
+</Window>"#;
+    let units = extract_units(Path::new("view.xaml"), source, Language::Text);
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].name, "view");
+    assert_eq!(units[0].unit_type, UnitType::Document);
+    assert_eq!(units[0].line, 1);
+    assert_eq!(units[0].end_line, 5);
+    assert_eq!(units[0].signature, r#"<Window Title="MainWindow">"#);
+    assert!(units[0].code.contains("Hello XAML"));
+}
+
+#[test]
 fn test_extract_empty_source() {
     let units = extract_units(Path::new("test.py"), "", Language::Python);
     assert!(units.is_empty());
