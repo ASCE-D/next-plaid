@@ -535,21 +535,22 @@ ColGREP automatically detects and repairs index/metadata desync from interrupted
 | Svelte     | `.svelte`                             |
 | HTML       | `.html`, `.htm`                       |
 
-### Text & Config (11 formats, document-level extraction)
+### Text & Config (12 formats, document-level extraction)
 
-| Format     | Extensions             |
-| ---------- | ---------------------- |
-| Markdown   | `.md`                  |
-| Plain text | `.txt`, `.rst`         |
-| AsciiDoc   | `.adoc`                |
-| Org        | `.org`                 |
-| YAML       | `.yaml`, `.yml`        |
-| TOML       | `.toml`                |
-| JSON       | `.json`                |
-| Dockerfile | `Dockerfile`           |
-| Makefile   | `Makefile`             |
-| Shell      | `.sh`, `.bash`, `.zsh` |
-| PowerShell | `.ps1`                 |
+| Format              | Extensions                    |
+| ------------------- | ----------------------------- |
+| Markdown            | `.md`                         |
+| Plain text          | `.txt`, `.rst`                |
+| XML (text fallback) | `.xml`, `.xsd`, `.xsl`, `.xslt`, `.xaml` |
+| AsciiDoc            | `.adoc`                       |
+| Org                 | `.org`                        |
+| YAML                | `.yaml`, `.yml`               |
+| TOML                | `.toml`                       |
+| JSON                | `.json`                       |
+| Dockerfile          | `Dockerfile`                  |
+| Makefile            | `Makefile`                    |
+| Shell               | `.sh`, `.bash`, `.zsh`        |
+| PowerShell          | `.ps1`                        |
 
 ---
 

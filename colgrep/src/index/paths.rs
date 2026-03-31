@@ -1,11 +1,13 @@
 //! Centralized index storage paths following XDG Base Directory Specification
 //!
 //! Index storage location:
-//! - Linux: ~/.local/share/colgrep/indices/
-//! - macOS: ~/Library/Application Support/colgrep/indices/
-//! - Windows: C:\Users\{user}\AppData\Roaming\colgrep\indices\
+//! - Any platform with XDG_DATA_HOME set: $XDG_DATA_HOME/colgrep/indices/
+//! - Linux default: ~/.local/share/colgrep/indices/
+//! - macOS default: ~/Library/Application Support/colgrep/indices/
+//! - Windows default: C:\Users\{user}\AppData\Roaming\colgrep\indices\
 
 use std::fs::{self, File};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -17,6 +19,16 @@ const STATE_FILE: &str = "state.json";
 const PROJECT_FILE: &str = "project.json";
 const INDEX_SUBDIR: &str = "index";
 const LOCK_FILE: &str = ".lock";
+
+fn xdg_data_home_override() -> Option<PathBuf> {
+    let raw: OsString = std::env::var_os("XDG_DATA_HOME")?;
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        None
+    }
+}
 
 /// Metadata about the project stored alongside the index
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,10 +68,19 @@ impl ProjectMetadata {
     }
 }
 
-/// Get the base colgrep data directory (XDG_DATA_HOME/colgrep or platform equivalent)
-pub fn get_colgrep_data_dir() -> Result<PathBuf> {
+/// Get the base colgrep data directory ($XDG_DATA_HOME/colgrep or platform equivalent).
+pub fn get_colgrep_base_dir() -> Result<PathBuf> {
+    if let Some(data_dir) = xdg_data_home_override() {
+        return Ok(data_dir.join("colgrep"));
+    }
+
     let data_dir = dirs::data_dir().context("Could not determine data directory")?;
-    Ok(data_dir.join("colgrep").join("indices"))
+    Ok(data_dir.join("colgrep"))
+}
+
+/// Get the directory containing all colgrep indices.
+pub fn get_colgrep_data_dir() -> Result<PathBuf> {
+    Ok(get_colgrep_base_dir()?.join("indices"))
 }
 
 /// Compute the index directory name for a project path
