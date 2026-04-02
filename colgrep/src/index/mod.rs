@@ -25,6 +25,84 @@ use paths::{
 };
 use state::{get_mtime, hash_file, FileInfo, IndexState};
 
+/// Estimates ETA based on character throughput rather than item count.
+/// Since encoding time scales with text length, tracking time-per-character
+/// gives accurate estimates even when items are sorted by length.
+struct EtaEstimator {
+    /// Total characters processed so far
+    total_chars: usize,
+    /// Cumulative encoding time
+    total_duration: std::time::Duration,
+    /// Total characters across all items (set once at init)
+    grand_total_chars: usize,
+}
+
+impl EtaEstimator {
+    fn new(total_chars: usize) -> Self {
+        Self {
+            total_chars: 0,
+            total_duration: std::time::Duration::ZERO,
+            grand_total_chars: total_chars,
+        }
+    }
+
+    fn record_batch(&mut self, batch_chars: usize, duration: std::time::Duration) {
+        self.total_chars += batch_chars;
+        self.total_duration += duration;
+    }
+
+    /// Returns ETA string like "Encoding... (2m 15s)" based on character throughput.
+    fn eta_message(&self) -> String {
+        if self.total_chars == 0 {
+            return "Encoding...".to_string();
+        }
+
+        let remaining_chars = self.grand_total_chars.saturating_sub(self.total_chars);
+        let time_per_char = self.total_duration.as_secs_f64() / self.total_chars as f64;
+        let eta_secs = (time_per_char * remaining_chars as f64) as u64;
+        let eta_mins = eta_secs / 60;
+        let eta_secs_rem = eta_secs % 60;
+        if eta_mins > 0 {
+            format!("Encoding... ({}m {}s)", eta_mins, eta_secs_rem)
+        } else {
+            format!("Encoding... ({}s)", eta_secs)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeStatus {
+    /// File bytes were valid UTF-8 and were decoded without substitutions.
+    Utf8,
+    /// File bytes were not valid UTF-8; decoding used replacement characters.
+    Lossy,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedSourceFile {
+    pub text: String,
+    pub decode_status: DecodeStatus,
+}
+
+/// Read a repository source file for parsing.
+///
+/// For invalid UTF-8 bytes, this performs *lossy* decoding (so the file can
+/// still be indexed and later reopened by search-result previews) while
+/// still failing on actual I/O errors.
+pub fn read_source_file(path: &Path) -> Result<DecodedSourceFile> {
+    let bytes = std::fs::read(path)?;
+
+    match std::str::from_utf8(&bytes) {
+        Ok(valid) => Ok(DecodedSourceFile {
+            text: valid.to_owned(),
+            decode_status: DecodeStatus::Utf8,
+        }),
+        Err(_) => Ok(DecodedSourceFile {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            decode_status: DecodeStatus::Lossy,
+        }),
+    }
+}
 /// Maximum file size to index (512 KB)
 /// Files larger than this are skipped to avoid:
 /// - Slow parsing of generated/minified code
@@ -692,12 +770,8 @@ impl IndexBuilder {
             }
         }
 
-        let files_to_index: Vec<PathBuf> = files_added
-            .iter()
-            .chain(files_changed.iter())
-            .filter(|p| !state.ignored_files.contains(*p))
-            .cloned()
-            .collect();
+        let files_to_index: Vec<PathBuf> =
+            files_added.iter().chain(files_changed.iter()).cloned().collect();
 
         if files_to_index.is_empty() {
             return Ok(UpdateStats {
@@ -733,8 +807,8 @@ impl IndexBuilder {
                     continue;
                 }
             };
-            let source = match std::fs::read_to_string(&full_path) {
-                Ok(s) => s,
+            let source = match read_source_file(&full_path) {
+                Ok(s) => s.text,
                 Err(e) => {
                     eprintln!("⚠️  Skipping {} ({})", full_path.display(), e);
                     new_state.ignored_files.insert(path.clone());
@@ -744,6 +818,7 @@ impl IndexBuilder {
             };
             let units = extract_units(path, &source, lang);
             new_units.extend(units);
+            new_state.ignored_files.remove(path);
 
             let content_hash = match hash_file(&full_path) {
                 Ok(h) => h,
@@ -987,8 +1062,8 @@ impl IndexBuilder {
                     continue;
                 }
             };
-            let source = match std::fs::read_to_string(&full_path) {
-                Ok(s) => s,
+            let source = match read_source_file(&full_path) {
+                Ok(s) => s.text,
                 Err(e) => {
                     eprintln!("⚠️  Skipping {} ({})", full_path.display(), e);
                     state.ignored_files.insert(path.clone());
@@ -998,6 +1073,7 @@ impl IndexBuilder {
             };
             let units = extract_units(path, &source, lang);
             all_units.extend(units);
+            state.ignored_files.remove(path);
 
             let content_hash = match hash_file(&full_path) {
                 Ok(h) => h,
@@ -1148,14 +1224,9 @@ impl IndexBuilder {
             state.files.remove(&path);
         }
 
-        // 2. Index new/changed files (skip previously ignored files)
-        let files_to_index: Vec<PathBuf> = plan
-            .added
-            .iter()
-            .chain(plan.changed.iter())
-            .filter(|p| !state.ignored_files.contains(*p))
-            .cloned()
-            .collect();
+        // 2. Index new/changed files
+        let files_to_index: Vec<PathBuf> =
+            plan.added.iter().chain(plan.changed.iter()).cloned().collect();
 
         let mut new_units: Vec<CodeUnit> = Vec::new();
 
@@ -1194,8 +1265,8 @@ impl IndexBuilder {
                     continue;
                 }
             };
-            let source = match std::fs::read_to_string(&full_path) {
-                Ok(s) => s,
+            let source = match read_source_file(&full_path) {
+                Ok(s) => s.text,
                 Err(e) => {
                     eprintln!("⚠️  Skipping {} ({})", full_path.display(), e);
                     state.files.remove(path);
@@ -1209,6 +1280,7 @@ impl IndexBuilder {
             };
             let units = extract_units(path, &source, lang);
             new_units.extend(units);
+            state.ignored_files.remove(path);
 
             let content_hash = match hash_file(&full_path) {
                 Ok(h) => h,
@@ -1246,7 +1318,7 @@ impl IndexBuilder {
         }
 
         // Delete stale index entries for skipped files that were previously indexed
-        // (e.g., files that became unreadable due to invalid UTF-8)
+        // (e.g., files that became unreadable)
         for file_path in &skipped_files {
             if plan.changed.contains(file_path) {
                 let _ = self.delete_file_from_index(index_path_str, file_path);
@@ -1691,10 +1763,6 @@ impl IndexBuilder {
         let mut plan = UpdatePlan::default();
 
         for path in &current_files {
-            // Skip files that previously failed to parse (e.g. invalid UTF-8)
-            if state.ignored_files.contains(path) {
-                continue;
-            }
             let full_path = self.project_root.join(path);
             let hash = match hash_file(&full_path) {
                 Ok(h) => h,
@@ -2857,6 +2925,8 @@ fn prompt_large_index_confirmation(num_units: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_glob_simple_extension() {
@@ -2986,6 +3056,85 @@ mod tests {
             &patterns
         ));
         assert!(!matches_glob_pattern(Path::new("src/main.js"), &patterns));
+    }
+
+    #[test]
+    fn test_read_source_file_accepts_invalid_utf8() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("legacy.hpp");
+        fs::write(&file_path, b"class Caf\xe9Header {}\n").unwrap();
+
+        let decoded = read_source_file(&file_path).unwrap();
+
+        assert_eq!(decoded.decode_status, DecodeStatus::Lossy);
+        let source = decoded.text;
+        assert!(source.contains("class Caf"));
+        assert!(source.contains("Header"));
+        assert!(source.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn test_read_source_file_returns_utf8_status_for_valid_utf8() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("valid.hpp");
+        let bytes = b"class Header {}\n";
+        fs::write(&file_path, bytes).unwrap();
+
+        let decoded = read_source_file(&file_path).unwrap();
+        assert_eq!(decoded.decode_status, DecodeStatus::Utf8);
+        assert_eq!(decoded.text, String::from_utf8(bytes.to_vec()).unwrap());
+    }
+
+    #[test]
+    fn test_indexing_pipeline_does_not_skip_invalid_utf8_sources() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Ensure the parser/indexing pipeline can consume lossy-decoded
+        // content instead of skipping on UTF-8 decoding errors.
+        let cases = vec![
+            (
+                "bad.cpp",
+                b"#include <iostream>\n// invalid: \xff\nint foo(){return 0;}\n".as_slice(),
+                Language::Cpp,
+                "int foo",
+            ),
+            (
+                "bad.cs",
+                b"class Foo { // invalid: \xff\n  void Bar() { }\n}\n".as_slice(),
+                Language::CSharp,
+                "Bar",
+            ),
+            (
+                "bad.hpp",
+                b"// invalid: \xff\n#pragma once\nstruct S { int foo; };\n".as_slice(),
+                Language::Cpp,
+                "foo",
+            ),
+        ];
+
+        for (name, bytes, expected_lang, needle) in cases {
+            let file_path = temp_dir.path().join(name);
+            fs::write(&file_path, bytes).unwrap();
+
+            let decoded = read_source_file(&file_path).unwrap();
+            assert_eq!(decoded.decode_status, DecodeStatus::Lossy);
+
+            let lang = detect_language(&file_path).expect("test file extension should be recognized");
+            assert_eq!(lang, expected_lang);
+
+            let units = extract_units(&file_path, &decoded.text, lang);
+            assert!(
+                !units.is_empty(),
+                "expected at least one parsed unit for {}",
+                file_path.display()
+            );
+            assert!(
+                units.iter().any(|u| u.code.contains(needle)),
+                "expected extracted units to contain {} for {}",
+                needle,
+                file_path.display()
+            );
+        }
     }
 
     #[test]

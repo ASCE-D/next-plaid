@@ -128,6 +128,12 @@ impl PatternMatcher {
     }
 }
 
+fn read_source_file_for_preview(
+    path: &Path,
+) -> Option<colgrep::index::DecodedSourceFile> {
+    colgrep::index::read_source_file(path).ok()
+}
+
 /// Strip regex special characters from a pattern for use in semantic queries.
 ///
 /// When combining a regex pattern with a semantic query, the regex metacharacters
@@ -520,7 +526,8 @@ pub fn cmd_search(
                     println!("file: {}", display_path(&file, use_relative).cyan());
                     for result in file_results {
                         let file_to_read = &result.unit.file;
-                        if let Ok(content) = std::fs::read_to_string(file_to_read) {
+                        if let Some(decoded) = read_source_file_for_preview(file_to_read) {
+                            let content = decoded.text;
                             let lines: Vec<&str> = content.lines().collect();
                             let end = result.unit.end_line.min(lines.len());
                             let max_lines = if show_content {
@@ -620,7 +627,8 @@ pub fn cmd_search(
                     println!("file: {}", display_path(&file, use_relative).cyan());
                     for result in file_results {
                         let file_to_read = &result.unit.file;
-                        if let Ok(content) = std::fs::read_to_string(file_to_read) {
+                    if let Some(decoded) = read_source_file_for_preview(file_to_read) {
+                        let content = decoded.text;
                             let lines: Vec<&str> = content.lines().collect();
                             let end = result.unit.end_line.min(lines.len());
                             let max_lines = if show_content { 250 } else { context_lines };
@@ -1335,6 +1343,8 @@ fn search_single_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     // Test resolve_top_k function
     #[test]
@@ -1352,6 +1362,25 @@ mod tests {
         let result = resolve_top_k(None, 15);
         // Should be either 25 (default) or whatever is in config
         assert!(result > 0);
+    }
+
+    #[test]
+    fn test_preview_read_source_file_lossy_utf8() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("preview.cpp");
+        fs::write(
+            &file_path,
+            b"// invalid: \xff\nint foo(){return 0;}\n",
+        )
+        .unwrap();
+
+        let decoded = read_source_file_for_preview(&file_path).unwrap();
+        assert_eq!(decoded.decode_status, colgrep::index::DecodeStatus::Lossy);
+
+        let content = &decoded.text;
+        assert!(content.contains('\u{fffd}'));
+        let lines: Vec<&str> = content.lines().collect();
+        assert!(!lines.is_empty());
     }
 
     // Test resolve_context_lines function
