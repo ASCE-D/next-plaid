@@ -33,10 +33,12 @@ use paths::{
 };
 use state::{get_mtime, hash_file, FileInfo, IndexState};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeStatus {
     /// File bytes were valid UTF-8 and were decoded without substitutions.
     Utf8,
+    /// File bytes were transcoded from a detected encoding to UTF-8.
+    Transcoded { encoding: String },
     /// File bytes were not valid UTF-8; decoding used replacement characters.
     Lossy,
 }
@@ -49,22 +51,53 @@ pub struct DecodedSourceFile {
 
 /// Read a repository source file for parsing.
 ///
-/// For invalid UTF-8 bytes, this performs *lossy* decoding (so the file can
-/// still be indexed and later reopened by search-result previews) while
-/// still failing on actual I/O errors.
+/// Attempts to decode the file as UTF-8. If it is not valid UTF-8, uses
+/// `chardetng` to detect the encoding and `encoding_rs` to transcode it.
+/// Falls back to lossy UTF-8 decoding when detection confidence is low or
+/// transcoding produces errors.
 pub fn read_source_file(path: &Path) -> Result<DecodedSourceFile> {
     let bytes = std::fs::read(path)?;
 
-    match std::str::from_utf8(&bytes) {
-        Ok(valid) => Ok(DecodedSourceFile {
+    // Fast path: valid UTF-8
+    if let Ok(valid) = std::str::from_utf8(&bytes) {
+        return Ok(DecodedSourceFile {
             text: valid.to_owned(),
             decode_status: DecodeStatus::Utf8,
-        }),
-        Err(_) => Ok(DecodedSourceFile {
+        });
+    }
+
+    // Count non-ASCII bytes for confidence check
+    let non_ascii_count = bytes.iter().filter(|&&b| b > 0x7F).count();
+
+    // Too few non-ASCII bytes to reliably detect encoding
+    if non_ascii_count < 16 {
+        return Ok(DecodedSourceFile {
             text: String::from_utf8_lossy(&bytes).into_owned(),
             decode_status: DecodeStatus::Lossy,
-        }),
+        });
     }
+
+    // Detect encoding using chardetng
+    let mut detector = chardetng::EncodingDetector::new();
+    detector.feed(&bytes, true);
+    let detected = detector.guess(None, true);
+
+    // Transcode using encoding_rs
+    let (decoded, _encoding_used, had_errors) = detected.decode(&bytes);
+
+    if had_errors {
+        return Ok(DecodedSourceFile {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            decode_status: DecodeStatus::Lossy,
+        });
+    }
+
+    Ok(DecodedSourceFile {
+        text: decoded.into_owned(),
+        decode_status: DecodeStatus::Transcoded {
+            encoding: detected.name().to_string(),
+        },
+    })
 }
 
 /// Maximum file size to index (512 KB)
@@ -4088,5 +4121,83 @@ mod tests {
             &extra,
             &force
         ));
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_temp_file(content: &[u8]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(content).unwrap();
+        f
+    }
+
+    #[test]
+    fn test_read_source_file_utf8_unchanged() {
+        let tmp = write_temp_file(b"fn main() { println!(\"hello\"); }");
+        let result = read_source_file(tmp.path()).unwrap();
+        assert_eq!(result.decode_status, DecodeStatus::Utf8);
+        assert_eq!(result.text, "fn main() { println!(\"hello\"); }");
+    }
+
+    #[test]
+    fn test_read_source_file_windows_1252_detected() {
+        // Build a Windows-1252-encoded byte sequence with more than 16 non-ASCII bytes
+        // so chardetng can confidently detect the encoding and transcode cleanly.
+        // Use explicit byte array to be precise about count.
+        // é=\xe9 à=\xe0 è=\xe8 ï=\xef ç=\xe7 ô=\xf4 û=\xfb î=\xee ù=\xf9 ê=\xea
+        let bytes: &[u8] = &[
+            b'/', b'/', b' ',
+            b'R', 0xe9, b's', b'u', b'm', 0xe9,  // Résumé (2)
+            b' ', b'c', b'a', b'f', 0xe9,          // café (1)
+            b' ', b'n', b'a', 0xef, b'v', b'e',   // naïve (1)
+            b' ', b'f', b'a', 0xe7, b'a', b'd', b'e', // façade (1)
+            b'\n',
+            b'/', b'/', b' ',
+            b'p', b'r', 0xe9, b'c', 0xe9, b'd', b'e', b'n', b't', // précédent (2)
+            b' ', 0xe0, b' ', b'c', 0xf4, b't', 0xe9, // à côté (3)
+            b' ', b'o', 0xf9,                       // où (1)
+            b' ', b'f', b'l', 0xfb, b'r', b'e', b't', // flûret (1)
+            b' ', 0xee, b'l', b'e',                 // île (1)
+            b' ', 0xe8, b'l', 0xe8, b'v', b'e',    // élève (2)
+            b' ', 0xea, b't', b'r', b'e',           // être (1)
+            b'\n',
+            b'f', b'n', b' ', b'p', b'r', b'o', b'c', b'e', b's', b's', b'(', b')', b' ', b'{', b'}', b'\n',
+        ];
+        let non_ascii = bytes.iter().filter(|&&b| b > 0x7F).count();
+        println!("non_ascii_count: {}", non_ascii);
+        assert!(non_ascii >= 16, "Test must have >= 16 non-ASCII bytes, got {}", non_ascii);
+        let tmp = write_temp_file(bytes);
+        let result = read_source_file(tmp.path()).unwrap();
+        println!("decode_status: {:?}", result.decode_status);
+        assert!(!result.text.contains('\u{fffd}'), "Should not contain replacement chars");
+        match &result.decode_status {
+            DecodeStatus::Transcoded { encoding } => assert!(!encoding.is_empty()),
+            other => panic!("Expected Transcoded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_read_source_file_truly_binary_falls_back_lossy() {
+        let tmp = write_temp_file(&[0x00, 0x01, 0x02, 0x80, 0x81, 0xff, 0xfe, 0x00]);
+        let result = read_source_file(tmp.path()).unwrap();
+        assert_eq!(result.decode_status, DecodeStatus::Lossy);
+    }
+
+    #[test]
+    fn test_read_source_file_io_error_propagated() {
+        let result = read_source_file(Path::new("/nonexistent/file.rs"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_source_file_few_non_ascii_falls_back_lossy() {
+        // Only 1 non-ASCII byte — below the 16-byte threshold
+        let tmp = write_temp_file(b"// caf\xe9\nfn main() {}\n");
+        let result = read_source_file(tmp.path()).unwrap();
+        assert_eq!(result.decode_status, DecodeStatus::Lossy);
     }
 }
