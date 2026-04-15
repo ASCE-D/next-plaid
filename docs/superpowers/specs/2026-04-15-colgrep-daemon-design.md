@@ -527,6 +527,609 @@ ENVIRONMENT:
 | `colgrep/src/parser/mod.rs` | Route `Language::Xml` to new XML parser |
 | `colgrep/Cargo.toml` | Add new dependencies |
 
+## Test-Driven Development Plan
+
+All tests are written RED (failing) before implementation. Each section below maps to an implementation phase. Tests serve as the specification — if the tests pass, the feature is done.
+
+### Phase 1: Non-UTF8 Encoding Detection
+
+Tests written in `colgrep/src/index/mod.rs` (unit) and `colgrep/src/index/tests/` (integration).
+
+```rust
+// --- Unit tests for read_source_file() upgrade ---
+
+#[test]
+fn test_read_source_file_utf8_unchanged() {
+    // Valid UTF-8 file returns DecodeStatus::Utf8, text matches exactly
+    let tmp = write_temp_file(b"fn main() { println!(\"hello\"); }");
+    let result = read_source_file(&tmp).unwrap();
+    assert_eq!(result.decode_status, DecodeStatus::Utf8);
+    assert_eq!(result.text, "fn main() { println!(\"hello\"); }");
+}
+
+#[test]
+fn test_read_source_file_windows_1252_detected() {
+    // Windows-1252 encoded file with accented chars (e.g., 0xe9 = é)
+    // Should detect encoding and transcode correctly, NOT produce U+FFFD
+    let tmp = write_temp_file(b"// R\xe9sum\xe9 handler\nfn process() {}");
+    let result = read_source_file(&tmp).unwrap();
+    assert!(result.text.contains("Résumé"));
+    assert!(!result.text.contains('\u{fffd}'));
+    assert!(matches!(result.decode_status, DecodeStatus::Transcoded { .. }));
+}
+
+#[test]
+fn test_read_source_file_iso_8859_1_detected() {
+    // ISO-8859-1 file with German umlauts (0xfc = ü, 0xf6 = ö)
+    let tmp = write_temp_file(b"// \xdcber die Br\xfccke\nfn walk() {}");
+    let result = read_source_file(&tmp).unwrap();
+    assert!(result.text.contains("Über"));
+    assert!(result.text.contains("Brücke"));
+    assert!(!result.text.contains('\u{fffd}'));
+}
+
+#[test]
+fn test_read_source_file_truly_binary_falls_back_lossy() {
+    // Binary garbage that no encoding can decode meaningfully
+    let tmp = write_temp_file(&[0x00, 0x01, 0x02, 0x80, 0x81, 0xff, 0xfe, 0x00]);
+    let result = read_source_file(&tmp).unwrap();
+    assert_eq!(result.decode_status, DecodeStatus::Lossy);
+}
+
+#[test]
+fn test_read_source_file_io_error_propagated() {
+    // Non-existent file returns Err, not Ok with empty text
+    let result = read_source_file(Path::new("/nonexistent/file.rs"));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_decode_status_transcoded_stores_encoding_name() {
+    let tmp = write_temp_file(b"// caf\xe9\n");
+    let result = read_source_file(&tmp).unwrap();
+    if let DecodeStatus::Transcoded { encoding } = &result.decode_status {
+        // Should be "windows-1252" or "iso-8859-1" — both are valid for 0xe9
+        assert!(!encoding.is_empty());
+    } else {
+        panic!("Expected Transcoded, got {:?}", result.decode_status);
+    }
+}
+
+// --- Integration: indexed content is searchable ---
+
+#[test]
+fn test_windows_1252_file_indexed_and_searchable() {
+    // Create a temp project with a Windows-1252 encoded file
+    // Index it with IndexBuilder
+    // Search for the accented term
+    // Verify it appears in results with correct text
+    let project = create_temp_project_with_file(
+        "legacy.cs",
+        b"// M\xe9thode de v\xe9rification\npublic void V\xe9rifier() { }",
+    );
+    let mut builder = IndexBuilder::new(&project.path).unwrap();
+    builder.index(None, false).unwrap();
+
+    let searcher = Searcher::load(&project.path).unwrap();
+    let results = searcher.search("Vérifier method", 5, None).unwrap();
+    assert!(!results.is_empty());
+    assert!(results[0].unit.code.contains("Vérifier"));
+}
+```
+
+### Phase 2: XML Structural Parsing
+
+Tests written in `colgrep/src/parser/xml.rs` and `colgrep/src/parser/tests/test_xml.rs`.
+
+```rust
+// --- Unit tests for XML parser ---
+
+#[test]
+fn test_xml_language_detection() {
+    assert_eq!(detect_language(Path::new("config.xml")), Some(Language::Xml));
+    assert_eq!(detect_language(Path::new("schema.xsd")), Some(Language::Xml));
+    assert_eq!(detect_language(Path::new("transform.xsl")), Some(Language::Xml));
+    assert_eq!(detect_language(Path::new("style.xslt")), Some(Language::Xml));
+    assert_eq!(detect_language(Path::new("view.xaml")), Some(Language::Xml));
+}
+
+#[test]
+fn test_xml_extract_named_elements() {
+    let source = r#"<?xml version="1.0"?>
+<beans>
+  <bean id="userService" class="com.app.UserService">
+    <property name="repo" ref="userRepo"/>
+  </bean>
+  <bean id="orderService" class="com.app.OrderService"/>
+</beans>"#;
+    let units = extract_units(Path::new("app-context.xml"), source, Language::Xml);
+    // Should extract 2 units (one per bean), not 1 whole-file unit
+    assert_eq!(units.len(), 2);
+    assert!(units[0].signature.contains("userService"));
+    assert!(units[1].signature.contains("orderService"));
+    assert_eq!(units[0].unit_type, UnitType::Element);
+}
+
+#[test]
+fn test_xml_extract_xsd_types() {
+    let source = r#"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:complexType name="AddressType">
+    <xs:sequence>
+      <xs:element name="street" type="xs:string"/>
+      <xs:element name="city" type="xs:string"/>
+    </xs:sequence>
+  </xs:complexType>
+  <xs:simpleType name="ZipCode">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[0-9]{5}"/>
+    </xs:restriction>
+  </xs:simpleType>
+</xs:schema>"#;
+    let units = extract_units(Path::new("types.xsd"), source, Language::Xml);
+    assert_eq!(units.len(), 2);
+    assert!(units[0].signature.contains("AddressType"));
+    assert!(units[1].signature.contains("ZipCode"));
+}
+
+#[test]
+fn test_xml_extract_xslt_templates() {
+    let source = r#"<?xml version="1.0"?>
+<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="1.0">
+  <xsl:template match="/">
+    <html><body><xsl:apply-templates/></body></html>
+  </xsl:template>
+  <xsl:template name="header">
+    <h1>Title</h1>
+  </xsl:template>
+</xsl:stylesheet>"#;
+    let units = extract_units(Path::new("transform.xsl"), source, Language::Xml);
+    assert_eq!(units.len(), 2);
+    assert!(units[0].signature.contains("match=/"));
+    assert!(units[1].signature.contains("name=header"));
+}
+
+#[test]
+fn test_xml_preserves_line_numbers() {
+    let source = "<?xml version=\"1.0\"?>\n<root>\n  <item id=\"a\"/>\n  <item id=\"b\"/>\n</root>";
+    let units = extract_units(Path::new("items.xml"), source, Language::Xml);
+    // First item starts at line 3, second at line 4
+    for unit in &units {
+        assert!(unit.line >= 3);
+        assert!(unit.end_line >= unit.line);
+    }
+}
+
+#[test]
+fn test_xml_small_file_single_unit() {
+    // Trivial XML with no named elements falls back to single document unit
+    let source = r#"<?xml version="1.0"?><root><a>1</a></root>"#;
+    let units = extract_units(Path::new("tiny.xml"), source, Language::Xml);
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].unit_type, UnitType::Document);
+}
+
+#[test]
+fn test_xml_xaml_ui_elements() {
+    let source = r#"<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        x:Name="MainWindow" Title="My App">
+  <Grid x:Name="rootGrid">
+    <Button x:Name="submitBtn" Content="Submit"/>
+    <TextBox x:Name="inputField"/>
+  </Grid>
+</Window>"#;
+    let units = extract_units(Path::new("MainWindow.xaml"), source, Language::Xml);
+    // Should extract named UI elements
+    assert!(units.iter().any(|u| u.signature.contains("MainWindow")));
+    assert!(units.iter().any(|u| u.signature.contains("submitBtn")));
+}
+```
+
+### Phase 3: Daemon Core — Startup, Health, Shutdown
+
+Tests written in `colgrep/src/commands/serve.rs` (unit) and `colgrep/tests/serve_integration.rs`.
+
+```rust
+// --- Unit tests for AppState ---
+
+#[test]
+fn test_app_state_healthy_after_init() {
+    let state = AppState::new(test_index_path(), test_model_config()).unwrap();
+    let health = state.health();
+    assert_eq!(health.status, "ready");
+    assert!(health.index_doc_count > 0);
+}
+
+#[test]
+fn test_app_state_unhealthy_with_missing_index() {
+    let result = AppState::new(Path::new("/nonexistent/index"), test_model_config());
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_app_state_unhealthy_with_corrupted_index() {
+    let tmp = create_corrupted_index();
+    let result = AppState::new(&tmp, test_model_config());
+    assert!(result.is_err());
+}
+
+// --- Integration tests for HTTP endpoints ---
+// Uses axum::test helpers (no real network, in-process)
+
+#[tokio::test]
+async fn test_health_returns_200_when_ready() {
+    let app = create_test_app().await;
+    let response = app.oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = parse_body(response).await;
+    assert_eq!(body["status"], "ready");
+}
+
+#[tokio::test]
+async fn test_health_returns_503_before_init() {
+    let app = create_test_app_uninitialized().await;
+    let response = app.oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = parse_body(response).await;
+    assert_eq!(body["status"], "error");
+    assert!(body["reason"].as_str().unwrap().len() > 0);
+}
+
+#[tokio::test]
+async fn test_search_returns_503_when_unhealthy() {
+    let app = create_test_app_uninitialized().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"test"}"#))
+            .unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_search_returns_results() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"authentication handler","top_k":5}"#))
+            .unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = parse_body(response).await;
+    assert!(body["results"].as_array().unwrap().len() > 0);
+    assert!(body["search_time_ms"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn test_search_with_include_patterns() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"handler","include_patterns":["*.rs"]}"#))
+            .unwrap()
+    ).await.unwrap();
+    let body: serde_json::Value = parse_body(response).await;
+    for result in body["results"].as_array().unwrap() {
+        assert!(result["file"].as_str().unwrap().ends_with(".rs"));
+    }
+}
+
+#[tokio::test]
+async fn test_search_invalid_request_returns_400() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"not_query":"missing field"}"#))
+            .unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_search_empty_query_returns_400() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":""}"#))
+            .unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_search_response_includes_metadata() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"test","top_k":3}"#))
+            .unwrap()
+    ).await.unwrap();
+    let body: serde_json::Value = parse_body(response).await;
+    // Response must include timing, doc count, hybrid mode flag
+    assert!(body.get("search_time_ms").is_some());
+    assert!(body.get("index_doc_count").is_some());
+    assert!(body.get("hybrid_mode").is_some());
+}
+```
+
+### Phase 4: Concurrency & Backpressure
+
+```rust
+#[tokio::test]
+async fn test_concurrent_searches_all_succeed() {
+    let app = create_test_app_shared().await;
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            let response = app.oneshot(
+                Request::post("/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"query":"test query {}","top_k":3}}"#, i)))
+                    .unwrap()
+            ).await.unwrap();
+            response.status()
+        }));
+    }
+    for handle in handles {
+        let status = handle.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn test_max_concurrent_requests_returns_429() {
+    // Configure app with max_concurrent=2
+    let app = create_test_app_with_config(ServeConfig { max_concurrent: 2, ..default() }).await;
+    // Send 5 requests simultaneously, at least some should get 429
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            let response = app.oneshot(
+                Request::post("/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"test","top_k":1}"#))
+                    .unwrap()
+            ).await.unwrap();
+            response.status()
+        }));
+    }
+    let statuses: Vec<StatusCode> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(statuses.contains(&StatusCode::TOO_MANY_REQUESTS));
+}
+
+#[tokio::test]
+async fn test_request_timeout_returns_408() {
+    // Configure app with timeout=1s, use a query that would take longer
+    // (mock the model pool to sleep)
+    let app = create_test_app_with_slow_model(Duration::from_secs(5)).await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"slow query"}"#))
+            .unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+}
+```
+
+### Phase 5: Reload
+
+```rust
+#[tokio::test]
+async fn test_reload_returns_200_with_stats() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/reload")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = parse_body(response).await;
+    assert_eq!(body["status"], "reloaded");
+    assert!(body["doc_count"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn test_reload_does_not_interrupt_inflight_search() {
+    let app = create_test_app_shared().await;
+
+    // Start a slow search (mock model latency)
+    let search_app = app.clone();
+    let search_handle = tokio::spawn(async move {
+        let response = search_app.oneshot(
+            Request::post("/search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"inflight test"}"#))
+                .unwrap()
+        ).await.unwrap();
+        response.status()
+    });
+
+    // Immediately trigger reload
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let reload_response = app.clone().oneshot(
+        Request::post("/reload")
+            .body(Body::from("{}"))
+            .unwrap()
+    ).await.unwrap();
+    assert_eq!(reload_response.status(), StatusCode::OK);
+
+    // In-flight search should still complete successfully
+    let search_status = search_handle.await.unwrap();
+    assert_eq!(search_status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_reload_with_missing_index_returns_error() {
+    let app = create_test_app().await;
+    // Delete the index directory between reload calls
+    remove_test_index();
+    let response = app.oneshot(
+        Request::post("/reload")
+            .body(Body::from("{}"))
+            .unwrap()
+    ).await.unwrap();
+    // Should fail but daemon stays healthy with old index
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    // Health should still report ready (old index still loaded)
+    let health = app.oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+}
+```
+
+### Phase 6: Pre-warming & Startup Performance
+
+```rust
+#[test]
+fn test_prewarm_reads_all_index_pages() {
+    // Create a small test index with known size
+    let index_path = create_test_index(1000); // 1000 code units
+    let codes_path = index_path.join("index/merged_codes.npy");
+    let residuals_path = index_path.join("index/merged_residuals.npy");
+
+    // Pre-warm should not panic and should read all bytes
+    prewarm_index(&index_path).unwrap();
+
+    // Verify files are in OS page cache (platform-specific)
+    // On Linux: check /proc/self/smaps for referenced pages
+    // On macOS: this is best-effort, just verify no errors
+}
+
+#[test]
+fn test_prewarm_skipped_with_no_prewarm_flag() {
+    let config = ServeConfig { no_prewarm: true, ..default() };
+    let state = AppState::new_with_config(test_index_path(), config).unwrap();
+    // Should succeed without pre-warming
+    assert_eq!(state.health().status, "ready");
+}
+
+#[tokio::test]
+async fn test_startup_completes_within_timeout() {
+    let start = std::time::Instant::now();
+    let _app = create_test_app().await; // includes model load, index load, prewarm
+    let elapsed = start.elapsed();
+    // For test fixtures (small index), should be well under 30s
+    assert!(elapsed < Duration::from_secs(30));
+}
+```
+
+### Phase 7: Hybrid Search
+
+```rust
+#[tokio::test]
+async fn test_search_hybrid_default_alpha() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"function handler"}"#))
+            .unwrap()
+    ).await.unwrap();
+    let body: serde_json::Value = parse_body(response).await;
+    assert_eq!(body["hybrid_mode"], true);
+}
+
+#[tokio::test]
+async fn test_search_pure_semantic_with_alpha_1() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"handler","alpha":1.0}"#))
+            .unwrap()
+    ).await.unwrap();
+    let body: serde_json::Value = parse_body(response).await;
+    assert_eq!(body["hybrid_mode"], false);
+}
+
+#[tokio::test]
+async fn test_search_pure_bm25_with_alpha_0() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"handler","alpha":0.0}"#))
+            .unwrap()
+    ).await.unwrap();
+    let body: serde_json::Value = parse_body(response).await;
+    // Pure keyword search — results should contain the literal term
+    for result in body["results"].as_array().unwrap() {
+        assert!(result["code"].as_str().unwrap().to_lowercase().contains("handler"));
+    }
+}
+
+#[tokio::test]
+async fn test_search_alpha_out_of_range_returns_400() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"test","alpha":1.5}"#))
+            .unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+```
+
+### Test Infrastructure
+
+Each phase needs shared test helpers:
+
+```rust
+// colgrep/tests/common/mod.rs
+
+/// Create a temporary project directory with source files, run indexing,
+/// and return the path. Used by all integration tests.
+fn create_test_project() -> TempProject { ... }
+
+/// Create an Axum test app with a real index (small fixture).
+/// Uses axum::Router directly — no TCP, no ports.
+async fn create_test_app() -> Router { ... }
+
+/// Same as above but shared (Arc) for concurrent test cases.
+async fn create_test_app_shared() -> Router { ... }
+
+/// Create an app that hasn't finished initialization.
+async fn create_test_app_uninitialized() -> Router { ... }
+
+/// Create an app with custom config overrides.
+async fn create_test_app_with_config(config: ServeConfig) -> Router { ... }
+
+/// Parse response body as JSON.
+async fn parse_body(response: Response) -> serde_json::Value { ... }
+
+/// Write bytes to a temp file and return the path.
+fn write_temp_file(content: &[u8]) -> PathBuf { ... }
+```
+
+### Test Execution Order
+
+Tests are written and run in phase order. Each phase must be GREEN before moving to the next:
+
+```
+Phase 1: Non-UTF8 encoding       → cargo test -p colgrep encoding
+Phase 2: XML parsing              → cargo test -p colgrep xml
+Phase 3: Daemon core              → cargo test -p colgrep serve
+Phase 4: Concurrency              → cargo test -p colgrep concurrent
+Phase 5: Reload                   → cargo test -p colgrep reload
+Phase 6: Pre-warming              → cargo test -p colgrep prewarm
+Phase 7: Hybrid search            → cargo test -p colgrep hybrid
+```
+
 ## Success Criteria
 
 1. `colgrep serve` starts and reaches healthy state within 30s for a 6GB index
@@ -537,3 +1140,4 @@ ENVIRONMENT:
 6. Hybrid search (BM25 + semantic) works via `alpha` parameter
 7. `POST /reload` swaps index without disrupting in-flight searches
 8. No search request ever triggers filesystem scanning or model reloading
+9. All TDD tests pass green before feature is considered complete
