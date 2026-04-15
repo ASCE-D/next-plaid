@@ -686,4 +686,59 @@ pub enum Commands {
         #[arg(long = "clear-force-include")]
         clear_force_include: bool,
     },
+
+    /// Start the colgrep daemon server
+    #[command(after_help = "Start an HTTP server for fast, concurrent semantic search.\n\n\
+        The daemon loads the model and index once at startup, then serves\n\
+        search requests without filesystem scanning or model reloading.\n\n\
+        Example: colgrep serve --port 8080 --index /data/index")]
+    Serve {
+        /// Listen port
+        #[arg(long, default_value = "8080")]
+        port: u16,
+
+        /// Listen address
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+
+        /// Path to colgrep index directory
+        #[arg(long)]
+        index: std::path::PathBuf,
+
+        /// Model name
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Number of ONNX sessions for concurrent query encoding
+        #[arg(long, default_value = "4")]
+        sessions: usize,
+
+        /// Request timeout in seconds
+        #[arg(long, default_value = "30")]
+        timeout: u64,
+
+        /// Max concurrent requests
+        #[arg(long, default_value = "64")]
+        max_concurrent: usize,
+
+        /// Default hybrid search alpha (0.0 = pure BM25, 1.0 = pure semantic)
+        #[arg(long, default_value = "0.75")]
+        alpha: f32,
+
+        /// Disable FTS5 hybrid search
+        #[arg(long)]
+        no_hybrid_search: bool,
+
+        /// Skip index pre-warming at startup
+        #[arg(long)]
+        no_prewarm: bool,
+
+        /// Use INT8 quantized model
+        #[arg(long)]
+        quantized: bool,
+
+        /// Force CPU execution
+        #[arg(long)]
+        force_cpu: bool,
+    },
 }

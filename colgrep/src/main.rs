@@ -18,8 +18,8 @@ use colgrep::{
 use cli::{Cli, Commands};
 use commands::search::{resolve_pool_factor, resolve_top_k};
 use commands::{
-    cmd_clear, cmd_config, cmd_init, cmd_reset_stats, cmd_search, cmd_session_hook, cmd_set_model,
-    cmd_stats, cmd_status, cmd_task_hook, cmd_update, InitOptions,
+    cmd_clear, cmd_config, cmd_init, cmd_reset_stats, cmd_search, cmd_serve, cmd_session_hook,
+    cmd_set_model, cmd_stats, cmd_status, cmd_task_hook, cmd_update, InitOptions, ServeConfig,
 };
 
 fn main() -> Result<()> {
@@ -237,6 +237,35 @@ fn main() -> Result<()> {
                 static_batch,
             },
         ),
+        Some(Commands::Serve {
+            port,
+            host,
+            index,
+            model,
+            sessions,
+            timeout,
+            max_concurrent,
+            alpha,
+            no_hybrid_search,
+            no_prewarm,
+            quantized,
+            force_cpu,
+        }) => {
+            cmd_serve(ServeConfig {
+                port,
+                host,
+                index,
+                model,
+                sessions,
+                timeout,
+                max_concurrent,
+                alpha,
+                no_hybrid_search,
+                no_prewarm,
+                quantized,
+                force_cpu,
+            })
+        }
         Some(Commands::Update) => cmd_update(),
         Some(Commands::Status { path }) => cmd_status(&path),
         Some(Commands::Clear { path, all }) => cmd_clear(&path, all),
