@@ -33,6 +33,7 @@ pub enum Language {
     Svelte,
     // Text/config formats (no tree-sitter, indexed as documents)
     Html,
+    Xml,
     Markdown,
     Text,
     Yaml,
@@ -79,6 +80,7 @@ impl FromStr for Language {
             "svelte" => Ok(Language::Svelte),
             // Text/config formats
             "html" | "htm" => Ok(Language::Html),
+            "xml" | "xsd" | "xsl" | "xslt" | "xaml" => Ok(Language::Xml),
             "markdown" | "md" => Ok(Language::Markdown),
             "text" | "txt" => Ok(Language::Text),
             "yaml" | "yml" => Ok(Language::Yaml),

@@ -50,7 +50,7 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         "txt" | "text" | "rst" => Some(Language::Text),
         // Temporary fallback until real XML support exists: route XML/XAML-family
         // documents through the same document-level text extraction as .txt.
-        "xml" | "xsd" | "xsl" | "xslt" | "xaml" => Some(Language::Text),
+        "xml" | "xsd" | "xsl" | "xslt" | "xaml" => Some(Language::Xml),
         "adoc" | "asciidoc" => Some(Language::AsciiDoc),
         "org" => Some(Language::Org),
         // Config formats
@@ -113,6 +113,8 @@ pub fn get_tree_sitter_language(lang: Language) -> TsLanguage {
         Language::Vue | Language::Svelte => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         // HTML uses tree-sitter-html
         Language::Html => tree_sitter_html::LANGUAGE.into(),
+        // XML uses HTML tree-sitter parser (compatible superset)
+        Language::Xml => tree_sitter_html::LANGUAGE.into(),
         // Text/config formats don't use tree-sitter - this should never be called
         Language::Markdown
         | Language::Text
@@ -275,15 +277,15 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_language_xml_family_maps_to_text() {
-        assert_eq!(detect_language(Path::new("feed.xml")), Some(Language::Text));
-        assert_eq!(detect_language(Path::new("schema.xsd")), Some(Language::Text));
-        assert_eq!(detect_language(Path::new("transform.xsl")), Some(Language::Text));
+    fn test_detect_language_xml_family() {
+        assert_eq!(detect_language(Path::new("feed.xml")), Some(Language::Xml));
+        assert_eq!(detect_language(Path::new("schema.xsd")), Some(Language::Xml));
+        assert_eq!(detect_language(Path::new("transform.xsl")), Some(Language::Xml));
         assert_eq!(
             detect_language(Path::new("templates/layout.xslt")),
-            Some(Language::Text)
+            Some(Language::Xml)
         );
-        assert_eq!(detect_language(Path::new("view.xaml")), Some(Language::Text));
+        assert_eq!(detect_language(Path::new("view.xaml")), Some(Language::Xml));
     }
 
     #[test]
