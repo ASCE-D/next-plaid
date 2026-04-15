@@ -473,6 +473,10 @@ pub fn get_config_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
+
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn test_config_default() {
@@ -818,5 +822,55 @@ mod tests {
 
         let deserialized: Config = serde_json::from_str(&json).unwrap();
         assert!(deserialized.use_relative_paths());
+    }
+
+    #[test]
+    fn test_config_load_fails_on_malformed_json_strict_utf8() {
+        let temp_dir = TempDir::new().unwrap();
+        let _guard = TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("test mutex poisoned");
+
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", temp_dir.path());
+
+        let path = get_config_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        let res = Config::load();
+        assert!(res.is_err());
+
+        if let Some(prev) = prev {
+            std::env::set_var("XDG_DATA_HOME", prev);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    fn test_config_load_fails_on_invalid_utf8_strict_read() {
+        let temp_dir = TempDir::new().unwrap();
+        let _guard = TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("test mutex poisoned");
+
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", temp_dir.path());
+
+        let path = get_config_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"\xff\xfe\xfd").unwrap();
+
+        let res = Config::load();
+        assert!(res.is_err());
+
+        if let Some(prev) = prev {
+            std::env::set_var("XDG_DATA_HOME", prev);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
     }
 }

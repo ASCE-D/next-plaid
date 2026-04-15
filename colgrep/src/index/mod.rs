@@ -33,6 +33,40 @@ use paths::{
 };
 use state::{get_mtime, hash_file, FileInfo, IndexState};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeStatus {
+    /// File bytes were valid UTF-8 and were decoded without substitutions.
+    Utf8,
+    /// File bytes were not valid UTF-8; decoding used replacement characters.
+    Lossy,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedSourceFile {
+    pub text: String,
+    pub decode_status: DecodeStatus,
+}
+
+/// Read a repository source file for parsing.
+///
+/// For invalid UTF-8 bytes, this performs *lossy* decoding (so the file can
+/// still be indexed and later reopened by search-result previews) while
+/// still failing on actual I/O errors.
+pub fn read_source_file(path: &Path) -> Result<DecodedSourceFile> {
+    let bytes = std::fs::read(path)?;
+
+    match std::str::from_utf8(&bytes) {
+        Ok(valid) => Ok(DecodedSourceFile {
+            text: valid.to_owned(),
+            decode_status: DecodeStatus::Utf8,
+        }),
+        Err(_) => Ok(DecodedSourceFile {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            decode_status: DecodeStatus::Lossy,
+        }),
+    }
+}
+
 /// Maximum file size to index (512 KB)
 /// Files larger than this are skipped to avoid:
 /// - Slow parsing of generated/minified code
@@ -617,8 +651,9 @@ fn parse_files_parallel(
 
             let full_path = project_root.join(path);
             let result = match detect_language(&full_path) {
-                Some(lang) => match std::fs::read_to_string(&full_path) {
-                    Ok(source) => {
+                Some(lang) => match read_source_file(&full_path) {
+                    Ok(decoded) => {
+                        let source = decoded.text;
                         let units = extract_units(path, &source, lang);
                         match hash_file(&full_path) {
                             Ok(content_hash) => match get_mtime(&full_path) {
@@ -1462,12 +1497,8 @@ impl IndexBuilder {
             }
         }
 
-        let files_to_index: Vec<PathBuf> = files_added
-            .iter()
-            .chain(files_changed.iter())
-            .filter(|p| !state.ignored_files.contains(*p))
-            .cloned()
-            .collect();
+        let files_to_index: Vec<PathBuf> =
+            files_added.iter().chain(files_changed.iter()).cloned().collect();
 
         if files_to_index.is_empty() {
             return Ok(UpdateStats {
@@ -1502,6 +1533,7 @@ impl IndexBuilder {
             }
 
             new_units.extend(parsed.units);
+            new_state.ignored_files.remove(&parsed.path);
             if let Some(file_info) = parsed.file_info {
                 new_state.files.insert(parsed.path, file_info);
             }
@@ -1635,6 +1667,7 @@ impl IndexBuilder {
             }
 
             all_units.extend(parsed.units);
+            state.ignored_files.remove(&parsed.path);
             if let Some(file_info) = parsed.file_info {
                 state.files.insert(parsed.path, file_info);
             }
@@ -1787,14 +1820,9 @@ impl IndexBuilder {
             state.files.remove(&path);
         }
 
-        // 2. Index new/changed files (skip previously ignored files)
-        let files_to_index: Vec<PathBuf> = plan
-            .added
-            .iter()
-            .chain(plan.changed.iter())
-            .filter(|p| !state.ignored_files.contains(*p))
-            .cloned()
-            .collect();
+        // 2. Index new/changed files
+        let files_to_index: Vec<PathBuf> =
+            plan.added.iter().chain(plan.changed.iter()).cloned().collect();
 
         let mut new_units: Vec<CodeUnit> = Vec::new();
 
@@ -1825,6 +1853,7 @@ impl IndexBuilder {
             }
 
             new_units.extend(parsed.units);
+            state.ignored_files.remove(&parsed.path);
             if let Some(file_info) = parsed.file_info {
                 state.files.insert(parsed.path, file_info);
             }
@@ -2206,10 +2235,6 @@ impl IndexBuilder {
         let mut plan = UpdatePlan::default();
 
         for path in &current_files {
-            // Skip files that previously failed to parse (e.g. invalid UTF-8)
-            if state.ignored_files.contains(path) {
-                continue;
-            }
             let full_path = self.project_root.join(path);
             let hash = match hash_file(&full_path) {
                 Ok(h) => h,

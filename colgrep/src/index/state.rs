@@ -14,7 +14,8 @@ pub struct IndexState {
     #[serde(default)]
     pub cli_version: String,
     pub files: HashMap<PathBuf, FileInfo>,
-    /// Files that failed to parse (e.g. invalid UTF-8) — skipped on future runs
+    /// Files that failed to read or hash on the previous run.
+    /// These are retried on future runs and cleared after a successful read.
     #[serde(default)]
     pub ignored_files: HashSet<PathBuf>,
     /// Number of searches performed against this index
@@ -368,5 +369,27 @@ mod tests {
         for h in handles {
             h.join().expect("thread panicked");
         }
+    }
+
+    #[test]
+    fn test_index_state_load_fails_on_invalid_utf8() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_path = get_state_path(temp_dir.path());
+
+        fs::write(&state_path, b"\xff\xfe\xfd").unwrap();
+
+        let res = IndexState::load(temp_dir.path());
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_index_state_load_fails_on_malformed_json_strict_utf8() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_path = get_state_path(temp_dir.path());
+
+        fs::write(&state_path, b"{\"bad\":").unwrap();
+
+        let res = IndexState::load(temp_dir.path());
+        assert!(res.is_err());
     }
 }
