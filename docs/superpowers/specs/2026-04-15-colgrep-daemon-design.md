@@ -93,6 +93,7 @@ Primary endpoint for AI agents.
   "query": "authentication handler middleware",
   "top_k": 10,
   "alpha": 0.75,
+  "target_paths": ["src/auth", "src/middleware"],
   "include_patterns": ["*.py", "*.rs"],
   "exclude_patterns": ["*_test.py"],
   "exclude_dirs": ["vendor", "node_modules"],
@@ -104,10 +105,35 @@ Primary endpoint for AI agents.
 All fields except `query` are optional. Defaults:
 - `top_k`: 10
 - `alpha`: 0.75 (hybrid search balance, 0.0 = pure BM25, 1.0 = pure semantic)
-- `include_patterns`: [] (all files)
+- `target_paths`: [] (search entire index)
+- `include_patterns`: [] (all file types)
 - `exclude_patterns`: [] (none excluded)
 - `text_pattern`: null (no regex filter)
 - `code_only`: false
+
+#### Targeted Path Search
+
+`target_paths` is the key field for agent-driven search. When the AI agent knows or suspects the relevant code is in a specific module/directory, it passes one or more paths:
+
+```json
+{"query": "database connection pooling", "target_paths": ["src/db", "src/infra/persistence"]}
+```
+
+**How it works under the hood:**
+
+1. Each `target_path` is resolved relative to the indexed project root
+2. The filtering DB is queried for all code units whose `file` column starts with any target path
+3. The resulting doc IDs form a `subset` that is passed to the search engine
+4. Both semantic search and BM25 search only score documents in this subset
+5. Centroid probing is proportionally scaled up (fewer eligible centroids need more probes to maintain recall)
+
+**Why this is fast:** For a 720k code unit index, targeting `src/auth/` (say 2k units) means:
+- IVF probe only checks centroids containing those 2k docs (not all 720k)
+- Approximate scoring runs on ~2k candidates instead of ~50k
+- Decompression + exact scoring on ~50 candidates instead of ~1024
+- Estimated speedup: **5-10x** (sub-second search for targeted queries)
+
+`target_paths` composes with all other filters. If both `target_paths` and `include_patterns` are set, results must match both (intersection).
 
 **Response (200):**
 ```json
@@ -855,6 +881,131 @@ async fn test_search_response_includes_metadata() {
     assert!(body.get("search_time_ms").is_some());
     assert!(body.get("index_doc_count").is_some());
     assert!(body.get("hybrid_mode").is_some());
+}
+```
+
+### Phase 3b: Targeted Path Search
+
+Tests for `target_paths` — the agent narrows search to specific modules/directories.
+
+```rust
+#[tokio::test]
+async fn test_search_with_single_target_path() {
+    // Test fixture has files in src/auth/ and src/db/
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"handler","target_paths":["src/auth"]}"#))
+            .unwrap()
+    ).await.unwrap();
+    let body: serde_json::Value = parse_body(response).await;
+    for result in body["results"].as_array().unwrap() {
+        let file = result["file"].as_str().unwrap();
+        assert!(file.starts_with("src/auth"), "Expected src/auth, got {}", file);
+    }
+}
+
+#[tokio::test]
+async fn test_search_with_multiple_target_paths() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"query":"handler","target_paths":["src/auth","src/middleware"]}"#
+            ))
+            .unwrap()
+    ).await.unwrap();
+    let body: serde_json::Value = parse_body(response).await;
+    for result in body["results"].as_array().unwrap() {
+        let file = result["file"].as_str().unwrap();
+        assert!(
+            file.starts_with("src/auth") || file.starts_with("src/middleware"),
+            "Result outside target paths: {}", file
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_search_target_path_combined_with_include_pattern() {
+    // target_paths + include_patterns = intersection
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"query":"handler","target_paths":["src/auth"],"include_patterns":["*.rs"]}"#
+            ))
+            .unwrap()
+    ).await.unwrap();
+    let body: serde_json::Value = parse_body(response).await;
+    for result in body["results"].as_array().unwrap() {
+        let file = result["file"].as_str().unwrap();
+        assert!(file.starts_with("src/auth"));
+        assert!(file.ends_with(".rs"));
+    }
+}
+
+#[tokio::test]
+async fn test_search_target_path_nonexistent_returns_empty() {
+    // Targeting a path with no indexed files returns empty results, not an error
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"query":"handler","target_paths":["nonexistent/module"]}"#
+            ))
+            .unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = parse_body(response).await;
+    assert_eq!(body["results"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_search_empty_target_paths_searches_everything() {
+    // Empty array = no restriction (same as omitting the field)
+    let app = create_test_app().await;
+    let resp_no_target = app.clone().oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"handler","top_k":5}"#))
+            .unwrap()
+    ).await.unwrap();
+    let resp_empty_target = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"handler","top_k":5,"target_paths":[]}"#))
+            .unwrap()
+    ).await.unwrap();
+    let body1: serde_json::Value = parse_body(resp_no_target).await;
+    let body2: serde_json::Value = parse_body(resp_empty_target).await;
+    assert_eq!(body1["results"].as_array().unwrap().len(), body2["results"].as_array().unwrap().len());
+}
+
+#[tokio::test]
+async fn test_search_target_path_is_faster_than_full() {
+    // Targeted search on a small subdirectory should be measurably faster
+    let app = create_test_app_large().await; // larger fixture
+    let resp_full = app.clone().oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"handler","top_k":5}"#))
+            .unwrap()
+    ).await.unwrap();
+    let resp_targeted = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"handler","top_k":5,"target_paths":["src/auth"]}"#))
+            .unwrap()
+    ).await.unwrap();
+    let body_full: serde_json::Value = parse_body(resp_full).await;
+    let body_targeted: serde_json::Value = parse_body(resp_targeted).await;
+    let time_full = body_full["search_time_ms"].as_u64().unwrap();
+    let time_targeted = body_targeted["search_time_ms"].as_u64().unwrap();
+    assert!(time_targeted < time_full, "Targeted {}ms should be faster than full {}ms", time_targeted, time_full);
 }
 ```
 
