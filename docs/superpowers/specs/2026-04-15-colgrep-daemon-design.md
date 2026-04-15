@@ -515,7 +515,62 @@ Indexing runs in a different pod/job than serving. The indexing pod needs:
 - **RAM**: 2-4GB (encoding pipeline peak)
 - **Disk**: Index size + checkpoint storage (~6GB index + ~35GB checkpoint = **~45GB PVC**)
 - Checkpoint directory is temporary — cleaned up after successful index build
-- After indexing completes, the index artifacts are copied to the serving pod's PVC (or shared via ReadWriteMany PVC)
+
+### Storage: Custom Output Directory
+
+Both the daemon and the indexing CLI accept `--output-dir` to specify where index artifacts and checkpoints are written. This enables NFS/shared storage workflows where indexing and serving pods share a mount.
+
+**CLI:**
+```
+colgrep index /path/to/project --output-dir /mnt/nfs/colgrep-indices/my-project
+colgrep serve --index /mnt/nfs/colgrep-indices/my-project
+```
+
+**Startup write access verification:**
+
+At startup (both `colgrep index` and `colgrep serve`), the output directory is verified:
+
+1. Check directory exists (or create it if `--output-dir` specified)
+2. Write a temp probe file (`{dir}/.colgrep_write_probe_{pid}`)
+3. Fsync + read back to verify write succeeded
+4. Delete probe file
+5. If any step fails → clear error with actionable message:
+   ```
+   Error: Cannot write to /mnt/nfs/colgrep-indices/my-project
+   Reason: Permission denied
+
+   Fix: Ensure the directory exists and is writable:
+     chmod 775 /mnt/nfs/colgrep-indices/my-project
+     # or in K8s, set fsGroup in pod securityContext
+   ```
+
+**For the daemon (`colgrep serve`):**
+- `--output-dir` is where it reads the index from (same as `--index`)
+- Write access is only needed if `/reload` needs to stage temporary files during atomic swap
+- If read-only mount: `/reload` still works but uses in-memory staging instead of disk staging
+
+**For indexing (`colgrep index`):**
+- `--output-dir` is where it writes index + checkpoints
+- Write access is mandatory — fail fast at startup if not writable
+- Default: `{project_root}/.colgrep/` (existing behavior)
+
+**NFS workflow example:**
+```yaml
+# Shared NFS PVC mounted in both indexing job and serving deployment
+volumes:
+- name: colgrep-index
+  persistentVolumeClaim:
+    claimName: colgrep-nfs-pvc  # ReadWriteMany NFS volume
+
+# Indexing job writes to it:
+command: ["colgrep", "index", "/src", "--output-dir", "/data/index", "--resume"]
+
+# Serving pod reads from it:
+command: ["colgrep", "serve", "--index", "/data/index"]
+
+# After indexing completes, call POST /reload on the daemon
+# to pick up the new index without restart
+```
 
 ### As a Binary in Celery Pods
 
@@ -540,6 +595,12 @@ OPTIONS:
   --quantized                Use INT8 quantized model
   --force-cpu                Force CPU execution (no GPU)
 
+colgrep index [OPTIONS] <PROJECT_PATH>
+
+OPTIONS:
+  --output-dir <PATH>        Write index + checkpoints here [default: {project}/.colgrep/]
+  --resume                   Resume from checkpoint if one exists
+
 ENVIRONMENT:
   OPENBLAS_NUM_THREADS=1     Required: prevent BLAS thread contention
   RAYON_NUM_THREADS=<N>      Optional: control rayon pool size
@@ -561,6 +622,8 @@ ENVIRONMENT:
 | XML language variant | `colgrep/src/parser/types.rs` | Add `Language::Xml` |
 | Encoding checkpoint | `colgrep/src/index/checkpoint.rs` | Save/load/resume embedding chunks to disk |
 | Resume CLI flag | `colgrep/src/cli.rs` | Add `--resume` flag to index/init commands |
+| Output dir CLI flag | `colgrep/src/cli.rs` | Add `--output-dir` to index/init/serve commands |
+| Write access verification | `colgrep/src/index/storage.rs` | Probe file write + fsync + cleanup with clear error messages |
 
 ### New Dependencies
 
@@ -1534,6 +1597,7 @@ Phase 5: Reload                   → cargo test -p colgrep reload
 Phase 6: Pre-warming              → cargo test -p colgrep prewarm
 Phase 7: Hybrid search            → cargo test -p colgrep hybrid
 Phase 8: Resumable encoding       → cargo test -p colgrep checkpoint
+Phase 9: Output dir & write access → cargo test -p colgrep output_dir
 ```
 
 ## Resumable Encoding
@@ -1767,6 +1831,110 @@ fn test_interrupted_encoding_resumes_and_completes() {
 }
 ```
 
+### TDD Tests (Phase 9): Output Directory & Write Access
+
+```rust
+#[test]
+fn test_verify_write_access_succeeds_on_writable_dir() {
+    let tmp = TempDir::new().unwrap();
+    let result = verify_write_access(tmp.path());
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_verify_write_access_fails_on_readonly_dir() {
+    let tmp = TempDir::new().unwrap();
+    let readonly = tmp.path().join("readonly");
+    std::fs::create_dir(&readonly).unwrap();
+    // Make read-only
+    let mut perms = std::fs::metadata(&readonly).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&readonly, perms).unwrap();
+
+    let result = verify_write_access(&readonly);
+    assert!(result.is_err());
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(err_msg.contains("Permission denied") || err_msg.contains("cannot write"));
+
+    // Cleanup: restore write permission so TempDir can delete
+    let mut perms = std::fs::metadata(&readonly).unwrap().permissions();
+    perms.set_readonly(false);
+    std::fs::set_permissions(&readonly, perms).unwrap();
+}
+
+#[test]
+fn test_verify_write_access_fails_on_nonexistent_dir() {
+    let result = verify_write_access(Path::new("/nonexistent/path/xyz"));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_verify_write_access_probe_file_cleaned_up() {
+    let tmp = TempDir::new().unwrap();
+    verify_write_access(tmp.path()).unwrap();
+    // No probe files left behind
+    let entries: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
+    assert!(entries.iter().all(|e| {
+        !e.as_ref().unwrap().file_name().to_string_lossy().contains("colgrep_write_probe")
+    }));
+}
+
+#[test]
+fn test_output_dir_creates_directory_if_missing() {
+    let tmp = TempDir::new().unwrap();
+    let new_dir = tmp.path().join("new/nested/output");
+    assert!(!new_dir.exists());
+
+    init_output_dir(&new_dir).unwrap();
+    assert!(new_dir.exists());
+    verify_write_access(&new_dir).unwrap();
+}
+
+#[test]
+fn test_index_with_custom_output_dir() {
+    let project = create_test_project_with_n_files(10);
+    let output = TempDir::new().unwrap();
+
+    let mut builder = IndexBuilder::new(&project.path).unwrap();
+    builder.set_output_dir(output.path());
+    let stats = builder.index(None, false).unwrap();
+    assert_eq!(stats.added, 10);
+
+    // Index files should be in the custom output dir, not project dir
+    assert!(output.path().join("index/metadata.json").exists());
+
+    // Searchable from the custom location
+    let searcher = Searcher::load_from(output.path()).unwrap();
+    let results = searcher.search("test", 5, None).unwrap();
+    assert!(!results.is_empty());
+}
+
+#[test]
+fn test_checkpoint_written_to_output_dir() {
+    let project = create_test_project_with_n_files(50);
+    let output = TempDir::new().unwrap();
+
+    let mut builder = IndexBuilder::new(&project.path).unwrap();
+    builder.set_output_dir(output.path());
+    builder.set_interrupt_after_chunks(1);
+    let _ = builder.index(None, false);
+
+    // Checkpoint should be in output dir, not project dir
+    assert!(output.path().join("encoding_checkpoint/checkpoint.json").exists());
+    assert!(!project.path.join(".colgrep/encoding_checkpoint").exists());
+}
+
+#[tokio::test]
+async fn test_serve_startup_verifies_index_dir_readable() {
+    // Point daemon at a directory that exists but has no index
+    let tmp = TempDir::new().unwrap();
+    let result = AppState::new(tmp.path(), test_model_config());
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("index") || err.contains("metadata"));
+}
+```
+
 ## Success Criteria
 
 1. `colgrep serve` starts and reaches healthy state within 30s for a 6GB index
@@ -1778,4 +1946,5 @@ fn test_interrupted_encoding_resumes_and_completes() {
 7. `POST /reload` swaps index without disrupting in-flight searches
 8. No search request ever triggers filesystem scanning or model reloading
 9. `colgrep index --resume` recovers from a crash and completes encoding without re-doing finished chunks
-10. All TDD tests pass green before feature is considered complete
+10. `--output-dir` writes index/checkpoints to custom path; write access verified at startup with clear error if not writable
+11. All TDD tests pass green before feature is considered complete
