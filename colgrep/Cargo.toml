@@ -101,6 +101,14 @@ ndarray = "0.16"
 chardetng = "0.1"
 encoding_rs = "0.8"
 
+# === HTTP daemon ===
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+arc-swap = "1"
+tower = { version = "0.5", features = ["timeout", "limit"] }
+tower-http = { version = "0.6", features = ["cors"] }
+chrono = { version = "0.4", features = ["serde"] }
+
 [dev-dependencies]
 tempfile = "3"
 
