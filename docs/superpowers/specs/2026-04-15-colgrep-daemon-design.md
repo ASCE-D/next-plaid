@@ -530,6 +530,8 @@ ENVIRONMENT:
 | Encoding detection | `colgrep/src/index/mod.rs` | Upgrade `read_source_file()` with `encoding_rs` |
 | XML parser | `colgrep/src/parser/xml.rs` | Tree-sitter XML structural extraction |
 | XML language variant | `colgrep/src/parser/types.rs` | Add `Language::Xml` |
+| Encoding checkpoint | `colgrep/src/index/checkpoint.rs` | Save/load/resume embedding chunks to disk |
+| Resume CLI flag | `colgrep/src/cli.rs` | Add `--resume` flag to index/init commands |
 
 ### New Dependencies
 
@@ -551,6 +553,7 @@ ENVIRONMENT:
 | `colgrep/src/index/mod.rs` | Upgrade `read_source_file()` to use `encoding_rs` |
 | `colgrep/src/parser/language.rs` | Map XML extensions to `Language::Xml` instead of `Language::Text` |
 | `colgrep/src/parser/mod.rs` | Route `Language::Xml` to new XML parser |
+| `colgrep/src/index/mod.rs` | Insert checkpoint stage in `run_chunk_pipeline()` between pool and index |
 | `colgrep/Cargo.toml` | Add new dependencies |
 
 ## Test-Driven Development Plan
@@ -1275,10 +1278,243 @@ Tests are written and run in phase order. Each phase must be GREEN before moving
 Phase 1: Non-UTF8 encoding       → cargo test -p colgrep encoding
 Phase 2: XML parsing              → cargo test -p colgrep xml
 Phase 3: Daemon core              → cargo test -p colgrep serve
+Phase 3b: Targeted path search    → cargo test -p colgrep target_path
 Phase 4: Concurrency              → cargo test -p colgrep concurrent
 Phase 5: Reload                   → cargo test -p colgrep reload
 Phase 6: Pre-warming              → cargo test -p colgrep prewarm
 Phase 7: Hybrid search            → cargo test -p colgrep hybrid
+Phase 8: Resumable encoding       → cargo test -p colgrep checkpoint
+```
+
+## Resumable Encoding
+
+### Problem
+
+The CLI shows two steps:
+
+```
+⠋ [████████████████████████████████████░░░░░] 18432/22000 (3m) Parsing files...
+⠋ [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 52000/720000 Encoding...
+                                                              ^^^^^^^^
+                                                              29 hours on 3 CPUs
+```
+
+Step 1 (parsing) is fast. Step 2 (encoding) runs the pipelined `tokenize → encode (ONNX) → pool → index → metadata` pipeline for 29 hours. If the process crashes, is OOM-killed, or the K8s pod is evicted at hour 25, all progress is lost — the pipeline holds everything in memory until the final atomic write.
+
+### How the Pipeline Works Today
+
+```
+run_chunk_pipeline():
+
+  for each chunk of 1024 code units:
+    main thread → tokenize_tx ──→ [tokenize] ──→ [encode (ONNX)] ──→ [pool] ──→ [index_stage] ──→ [metadata]
+                                                   ^^^^^^^^^^^^^^^
+                                                   29 hours total
+                                                   ~2.5 min/chunk
+
+  index_stage (initial create):
+    1. First chunk → spawn k-means in background
+    2. All chunks buffered in memory via coding channel
+    3. After k-means done → compress all chunks → atomic write
+    4. Nothing logged after "Encoding..." finishes
+```
+
+The silent step after encoding (k-means + compression + write) takes minutes, not hours.
+
+### Solution: Checkpoint After Pool Stage
+
+Insert a disk checkpoint between the pool stage and the index stage. Each chunk's embeddings are saved to disk after ONNX encoding + pooling, so a crash only loses the current in-flight chunk (~2.5 minutes of work).
+
+```
+New pipeline with checkpointing:
+
+  [tokenize] → [encode (ONNX)] → [pool] → [checkpoint] → [index_stage] → [metadata]
+                                            ^^^^^^^^^^^
+                                            NEW: save to disk
+
+  Checkpoint directory: {index_dir}/encoding_checkpoint/
+    chunk_0000.embeddings.npy    (pooled embeddings, ~50MB per chunk)
+    chunk_0000.units.json        (CodeUnit metadata for this chunk)
+    checkpoint.json              {"completed_chunks": 42, "total_chunks": 704}
+```
+
+### Resume Flow
+
+```
+colgrep index --resume /path/to/project
+
+  1. Load checkpoint.json → last_completed = 42
+  2. Skip parsing + encoding for chunks 0..42 (already on disk)
+  3. Resume pipeline from chunk 43
+  4. After all chunks encoded:
+     a. Load all saved embeddings from disk
+     b. K-means on heldout sample → centroids
+     c. Compress all chunks → codes + residuals
+     d. Write final PLAID index atomically
+     e. Delete checkpoint directory
+```
+
+### Implementation
+
+The change is in `run_chunk_pipeline()` and `run_index_stage()`:
+
+1. **Before the main loop** in `run_chunk_pipeline()`: check for `encoding_checkpoint/checkpoint.json`. If found, load `completed_chunks` count. Skip that many chunks in the `sorted_units.chunks()` iterator.
+
+2. **New checkpoint stage** between pool and index: after `run_pool_stage` produces a `PooledChunkForIndex`, serialize the embeddings (`Vec<Array2<f32>>`) and unit metadata to disk, then update `checkpoint.json` atomically (write to tmp, rename).
+
+3. **In `run_index_stage()`** (initial create mode): instead of receiving chunks from the pool channel, load all checkpoint files from disk. Feed them to k-means + compression as before.
+
+4. **New CLI flag**: `colgrep index --resume` enables checkpoint loading. Without it, any existing checkpoint directory is cleared on start (fresh index).
+
+5. **Cleanup**: after successful index write, delete `encoding_checkpoint/`.
+
+### Disk Space
+
+| Codebase | Chunks | Checkpoint Size | Final Index |
+|----------|--------|-----------------|-------------|
+| 720k units | ~704 chunks | ~35GB | 6GB |
+| 100k units | ~98 chunks | ~5GB | 800MB |
+
+The checkpoint is temporary — deleted after index build. For the user's case, 35GB temporary disk during a 29-hour encoding is acceptable.
+
+### What Stays Fast
+
+- K-means training: uses heldout sample from first chunk (~minutes)
+- Compression: processes all chunks through codec (~minutes)
+- Index write: single atomic operation (~seconds)
+- Metadata DB: already written incrementally via metadata_stage
+
+Only the ONNX encoding is slow. Everything after it is minutes at most. The checkpoint captures exactly the expensive work.
+
+### TDD Tests (Phase 8)
+
+```rust
+// --- Unit tests for checkpoint ---
+
+#[test]
+fn test_checkpoint_save_and_load() {
+    let tmp = TempDir::new().unwrap();
+    let checkpoint_dir = tmp.path().join("encoding_checkpoint");
+
+    let embeddings = vec![Array2::<f32>::zeros((10, 128))]; // 1 doc, 10 tokens, 128 dim
+    let units = vec![create_test_code_unit("src/main.rs", 1, 10)];
+
+    save_chunk_checkpoint(&checkpoint_dir, 0, &embeddings, &units).unwrap();
+
+    let checkpoint = load_checkpoint(&checkpoint_dir).unwrap();
+    assert_eq!(checkpoint.completed_chunks, 1);
+}
+
+#[test]
+fn test_checkpoint_resumes_from_last_completed() {
+    let tmp = TempDir::new().unwrap();
+    let checkpoint_dir = tmp.path().join("encoding_checkpoint");
+
+    // Save 3 chunks
+    for i in 0..3 {
+        let embeddings = vec![Array2::<f32>::zeros((10, 128))];
+        let units = vec![create_test_code_unit(&format!("src/file_{}.rs", i), 1, 10)];
+        save_chunk_checkpoint(&checkpoint_dir, i, &embeddings, &units).unwrap();
+    }
+
+    let checkpoint = load_checkpoint(&checkpoint_dir).unwrap();
+    assert_eq!(checkpoint.completed_chunks, 3);
+    // Pipeline should skip first 3 chunks on resume
+}
+
+#[test]
+fn test_checkpoint_atomic_write_survives_crash() {
+    let tmp = TempDir::new().unwrap();
+    let checkpoint_dir = tmp.path().join("encoding_checkpoint");
+
+    // Save chunk 0 successfully
+    save_chunk_checkpoint(&checkpoint_dir, 0, &test_embeddings(), &test_units()).unwrap();
+
+    // Simulate crash during chunk 1: write embeddings but not checkpoint.json update
+    let chunk_path = checkpoint_dir.join("chunk_0001.embeddings.npy");
+    std::fs::write(&chunk_path, b"partial data").unwrap();
+    // Don't update checkpoint.json
+
+    // On resume, should see only 1 completed chunk (chunk 0)
+    let checkpoint = load_checkpoint(&checkpoint_dir).unwrap();
+    assert_eq!(checkpoint.completed_chunks, 1);
+    // Partial chunk_0001 file should be ignored/overwritten
+}
+
+#[test]
+fn test_checkpoint_cleanup_after_index_build() {
+    let tmp = TempDir::new().unwrap();
+    let checkpoint_dir = tmp.path().join("encoding_checkpoint");
+
+    save_chunk_checkpoint(&checkpoint_dir, 0, &test_embeddings(), &test_units()).unwrap();
+    assert!(checkpoint_dir.exists());
+
+    cleanup_checkpoint(&checkpoint_dir).unwrap();
+    assert!(!checkpoint_dir.exists());
+}
+
+#[test]
+fn test_no_checkpoint_without_resume_flag() {
+    // Without --resume, existing checkpoint dir is cleared
+    let tmp = TempDir::new().unwrap();
+    let checkpoint_dir = tmp.path().join("encoding_checkpoint");
+    std::fs::create_dir_all(&checkpoint_dir).unwrap();
+    std::fs::write(checkpoint_dir.join("checkpoint.json"), r#"{"completed_chunks":5}"#).unwrap();
+
+    // init_checkpoint with resume=false should clear it
+    init_checkpoint(&checkpoint_dir, false).unwrap();
+    assert!(!checkpoint_dir.join("checkpoint.json").exists());
+}
+
+#[test]
+fn test_load_all_checkpoint_embeddings() {
+    let tmp = TempDir::new().unwrap();
+    let checkpoint_dir = tmp.path().join("encoding_checkpoint");
+
+    // Save 3 chunks with known dimensions
+    for i in 0..3 {
+        let embeddings = vec![
+            Array2::<f32>::ones((5, 128)),  // 1 doc, 5 tokens
+            Array2::<f32>::ones((8, 128)),  // 1 doc, 8 tokens
+        ];
+        save_chunk_checkpoint(&checkpoint_dir, i, &embeddings, &test_units_n(2)).unwrap();
+    }
+
+    let all_embeddings = load_all_checkpoint_embeddings(&checkpoint_dir, 3).unwrap();
+    // 3 chunks × 2 docs = 6 doc embeddings total
+    assert_eq!(all_embeddings.len(), 6);
+}
+
+// --- Integration test ---
+
+#[test]
+fn test_interrupted_encoding_resumes_and_completes() {
+    let project = create_test_project_with_n_files(50); // small but multi-chunk
+
+    // First run: index with simulated interrupt after 2 chunks
+    let mut builder = IndexBuilder::new(&project.path).unwrap();
+    builder.set_interrupt_after_chunks(2); // test hook
+    let result = builder.index(None, false);
+    assert!(result.is_err() || result.unwrap().added < 50);
+
+    // Checkpoint should exist
+    let checkpoint_dir = get_checkpoint_dir(&project.path);
+    assert!(checkpoint_dir.join("checkpoint.json").exists());
+
+    // Second run with --resume: should complete
+    let mut builder = IndexBuilder::new(&project.path).unwrap();
+    builder.set_resume(true);
+    let stats = builder.index(None, false).unwrap();
+    assert_eq!(stats.added, 50);
+
+    // Checkpoint should be cleaned up
+    assert!(!checkpoint_dir.exists());
+
+    // Index should be searchable
+    let searcher = Searcher::load(&project.path).unwrap();
+    let results = searcher.search("test function", 5, None).unwrap();
+    assert!(!results.is_empty());
+}
 ```
 
 ## Success Criteria
@@ -1291,4 +1527,5 @@ Phase 7: Hybrid search            → cargo test -p colgrep hybrid
 6. Hybrid search (BM25 + semantic) works via `alpha` parameter
 7. `POST /reload` swaps index without disrupting in-flight searches
 8. No search request ever triggers filesystem scanning or model reloading
-9. All TDD tests pass green before feature is considered complete
+9. `colgrep index --resume` recovers from a crash and completes encoding without re-doing finished chunks
+10. All TDD tests pass green before feature is considered complete
