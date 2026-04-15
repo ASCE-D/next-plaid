@@ -25,6 +25,7 @@ mod test_svelte;
 mod test_swift;
 mod test_typescript;
 mod test_vue;
+mod test_xml;
 mod test_zig;
 
 mod test_recursion_guard;

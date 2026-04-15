@@ -21,6 +21,7 @@ mod svelte;
 mod text;
 pub mod types;
 mod vue;
+mod xml;
 
 // New per-language tests
 #[cfg(test)]
@@ -104,6 +105,11 @@ pub fn extract_units(path: &Path, source: &str, lang: Language) -> Vec<CodeUnit>
     // Handle HTML files with special extraction logic
     if lang == Language::Html {
         return html::extract_html_units(path, source);
+    }
+
+    // Handle XML files with structural extraction
+    if lang == Language::Xml {
+        return xml::extract_xml_units(path, source);
     }
 
     let mut parser = Parser::new();
