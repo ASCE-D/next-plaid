@@ -1,5 +1,6 @@
 pub mod paths;
 pub mod state;
+pub mod storage;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
