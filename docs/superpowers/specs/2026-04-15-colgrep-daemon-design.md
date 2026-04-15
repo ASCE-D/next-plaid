@@ -103,11 +103,12 @@ Primary endpoint for AI agents.
 ```
 
 All fields except `query` are optional. Defaults:
-- `top_k`: 10
-- `alpha`: 0.75 (hybrid search balance, 0.0 = pure BM25, 1.0 = pure semantic)
+- `top_k`: 10 (capped at 1000 to prevent abuse)
+- `alpha`: 0.75 (hybrid search balance, 0.0 = pure BM25, 1.0 = pure semantic; must be 0.0-1.0)
 - `target_paths`: [] (search entire index)
 - `include_patterns`: [] (all file types)
 - `exclude_patterns`: [] (none excluded)
+- `exclude_dirs`: [] (no directories excluded)
 - `text_pattern`: null (no regex filter)
 - `code_only`: false
 
@@ -119,21 +120,26 @@ All fields except `query` are optional. Defaults:
 {"query": "database connection pooling", "target_paths": ["src/db", "src/infra/persistence"]}
 ```
 
-**How it works under the hood:**
+**How it works under the hood (already implemented in the search engine):**
 
-1. Each `target_path` is resolved relative to the indexed project root
-2. The filtering DB is queried for all code units whose `file` column starts with any target path
-3. The resulting doc IDs form a `subset` that is passed to the search engine
-4. Both semantic search and BM25 search only score documents in this subset
-5. Centroid probing is proportionally scaled up (fewer eligible centroids need more probes to maintain recall)
+1. Each `target_path` calls `Searcher::filter_by_path_prefix()` → SQL `WHERE file LIKE 'src/auth%'`
+2. Doc IDs from all target paths are unioned into a `subset: Vec<i64>`
+3. The subset is passed to `search_one_mmap()` in `next-plaid/src/search.rs`
+4. The search engine already has built-in subset optimization (lines 324-414):
+   - **Centroid pruning**: reads centroid codes for subset docs from `mmap_codes`, builds `eligible_centroids: HashSet<usize>` — only these centroids are scored during IVF probe
+   - **Probe scaling**: `n_ivf_probe` is scaled up by `total_docs / subset_docs` to maintain recall
+   - **Candidate filtering**: after probe, candidates are filtered to subset doc IDs only
+   - **Decompression**: only subset candidates go through exact scoring
+5. Both semantic search and FTS5 BM25 accept the same subset parameter
 
 **Why this is fast:** For a 720k code unit index, targeting `src/auth/` (say 2k units) means:
-- IVF probe only checks centroids containing those 2k docs (not all 720k)
+- Centroid pruning: only centroids containing embeddings from those 2k docs are scored (not all centroids)
+- IVF probe runs on a smaller centroid pool
 - Approximate scoring runs on ~2k candidates instead of ~50k
 - Decompression + exact scoring on ~50 candidates instead of ~1024
 - Estimated speedup: **5-10x** (sub-second search for targeted queries)
 
-`target_paths` composes with all other filters. If both `target_paths` and `include_patterns` are set, results must match both (intersection).
+`target_paths` composes with all other filters (`include_patterns`, `exclude_patterns`, `exclude_dirs`, `text_pattern`). All are intersected into a single subset before search.
 
 **Response (200):**
 ```json
@@ -184,12 +190,15 @@ Trigger index reload after external indexing completes.
 }
 ```
 
-**Behavior:**
-1. Load new MmapIndex in background thread
-2. Pre-warm new index pages
+**Behavior (synchronous — blocks until reload completes):**
+1. Load new MmapIndex in a `spawn_blocking` task
+2. Pre-warm new index pages (sequential read)
 3. Atomically swap via ArcSwap (lock-free)
 4. In-flight searches finish on old index; new searches use new index
-5. Drop old index reference (OS reclaims pages)
+5. Old index files must NOT be deleted until all references are dropped (the external indexer should write to a staging directory and atomic-rename, or the daemon watches a versioned path)
+6. Return response with timing
+
+Note: concurrent `/reload` calls are serialized by a reload mutex. A second reload arriving during an active reload waits for the first to complete.
 
 ### GET /health
 
@@ -228,29 +237,26 @@ Request received
    Release session back to pool.
   |
   v
-2. Hybrid search (if alpha < 1.0)    (~10-50ms)
-   FTS5 BM25 keyword search in parallel with semantic.
-   Fuse results via Reciprocal Rank Fusion (RRF).
+2. Parallel search fork:
+   |                                     |
+   v                                     v
+   2a. Semantic search (~100-300ms)      2b. BM25 keyword search (~10-50ms)
+   Centroid scoring (query.dot)          FTS5 query on SQLite (spawn_blocking)
+   IVF probe + approx scoring           Returns ranked doc IDs
+   Decompression + MaxSim exact scoring
+   |                                     |
+   +------------------+------------------+
+                      |
+                      v
+3. Reciprocal Rank Fusion              (~1ms, if alpha < 1.0)
+   Fuse semantic + BM25 results by rank.
+   alpha=0.75 means 75% semantic, 25% keyword weight.
+   (Skipped if alpha=1.0 pure semantic or alpha=0.0 pure BM25)
   |
   v
-3. Centroid scoring                   (~1-2ms)
-   query.dot(centroids) -- centroids already in RAM.
-   Batched via rayon if >100k centroids.
-  |
-  v
-4. IVF probe + approximate scoring   (~10-50ms)
-   Select top centroids per query token.
-   Score candidates using centroid codes (mmap, pages warm).
-  |
-  v
-5. Decompression + exact scoring      (~50-200ms)
-   Decompress top ~1024 candidates in chunks of 128 (rayon parallel).
-   MaxSim scoring with SIMD (AVX2/NEON).
-  |
-  v
-6. SQLite metadata fetch              (~10-50ms)
+4. SQLite metadata fetch              (~10-50ms)
    Fetch file paths, signatures, code for top_k results.
-   Connection from pool -- no open/close overhead.
+   spawn_blocking + Connection::open (matches next-plaid-api pattern).
   |
   v
 Response returned                     Total: ~1-3s warm
@@ -282,7 +288,7 @@ Response returned                     Total: ~1-3s warm
 | ONNX session | Pool of N sessions, mutex-guarded | Bottleneck for throughput |
 | Query embedding buffer | Stack-allocated per request | Dropped after response |
 | Scoring buffers | Rayon thread-local | No cross-request sharing |
-| SQLite connection | Connection pool (r2d2) | One connection per query |
+| SQLite connection | `spawn_blocking` + `Connection::open` (matches next-plaid-api pattern) | One connection per query |
 
 ### Thread Budget
 
@@ -296,10 +302,21 @@ Rayon thread pool:      num_cpus (shared across all requests)
   Used for: centroid batch scoring, approximate scoring, decompression
   OPENBLAS_NUM_THREADS=1 (critical: prevents contention within rayon tasks)
 
-SQLite connections:     16-32 (connection pool)
-  Used for: metadata fetch + FTS5 queries
+SQLite:                 spawn_blocking per query (no pool needed)
+  Used for: metadata fetch + FTS5 queries + subset filtering
   SQLite WAL mode for concurrent reads
+  Matches next-plaid-api pattern (handlers/metadata.rs, handlers/documents.rs)
 ```
+
+### Expected Latency Under Load
+
+| Concurrent Requests | Sessions | Encoding Wait | Total p95 |
+|---------------------|----------|---------------|-----------|
+| 1-8 | 8 | 0s | 2-5s |
+| 10-20 | 8 | 1-2s | 3-7s |
+| 30-50 | 8 | 3-6s | 5-11s |
+
+The 2-5s target applies when concurrency is at or below the session count. Beyond that, requests queue for ONNX encoding. With `target_paths` narrowing search, the actual search time drops to sub-second, so even queued requests complete faster.
 
 ### Backpressure
 
@@ -339,7 +356,7 @@ Add encoding detection so Windows-1252 and other legacy files are properly decod
    - ISO-8859-1 (Latin-1)
    - Shift_JIS, EUC-KR, GB2312 (if CJK codebases are in scope)
 4. Store detected encoding in `DecodeStatus` for metadata tracking
-5. Fall back to lossy UTF-8 if detection fails or confidence is too low
+5. Fall back to lossy UTF-8 if detection returns `windows-1252` with fewer than 16 non-ASCII bytes (too little signal to distinguish from binary garbage). For files with 16+ non-ASCII bytes, trust the detection result. Note: `chardetng` cannot distinguish Windows-1252 from ISO-8859-1 for bytes 0x80-0x9F (the only differing range) — both decodings are acceptable
 
 `chardetng` detects the encoding, `encoding_rs` does the transcoding. Both are from Mozilla, well-tested, and add ~250KB combined to binary size.
 
@@ -423,6 +440,9 @@ metadata:
 spec:
   replicas: 1
   template:
+    metadata:
+      labels:
+        app: colgrep-daemon
     spec:
       containers:
       - name: colgrep
@@ -488,6 +508,15 @@ spec:
 
 CPU: 2-4 cores. Searches use rayon (parallel scoring) and ONNX (inference). Idle between queries.
 
+### Indexing Pod (Separate from Serving)
+
+Indexing runs in a different pod/job than serving. The indexing pod needs:
+- **CPU**: As many as available (encoding is CPU-bound)
+- **RAM**: 2-4GB (encoding pipeline peak)
+- **Disk**: Index size + checkpoint storage (~6GB index + ~35GB checkpoint = **~45GB PVC**)
+- Checkpoint directory is temporary — cleaned up after successful index build
+- After indexing completes, the index artifacts are copied to the serving pod's PVC (or shared via ReadWriteMany PVC)
+
 ### As a Binary in Celery Pods
 
 Not recommended for the 6GB index case due to memory overhead competing with Celery workers. Use the standalone K8s pod approach and have Celery workers call it over HTTP.
@@ -541,7 +570,7 @@ ENVIRONMENT:
 | `tokio` | Async runtime | Already in workspace |
 | `tower` | Middleware (timeout, rate limit) | Already in workspace |
 | `arc-swap` | Lock-free atomic pointer swap | ~20KB |
-| `r2d2` + `r2d2_sqlite` | SQLite connection pool | ~50KB |
+| (none — use `tokio::task::spawn_blocking`) | SQLite access pattern (matches next-plaid-api) | 0 |
 | `chardetng` | Encoding detection | ~50KB |
 | `encoding_rs` | Encoding transcoding | ~200KB |
 | `tree-sitter-xml` | XML structural parsing | ~100KB |
@@ -885,6 +914,154 @@ async fn test_search_response_includes_metadata() {
     assert!(body.get("index_doc_count").is_some());
     assert!(body.get("hybrid_mode").is_some());
 }
+
+// --- Validation & edge cases ---
+
+#[tokio::test]
+async fn test_search_top_k_capped_at_1000() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"test","top_k":999999}"#))
+            .unwrap()
+    ).await.unwrap();
+    let body: serde_json::Value = parse_body(response).await;
+    // Should succeed but cap results
+    assert!(body["results"].as_array().unwrap().len() <= 1000);
+}
+
+#[tokio::test]
+async fn test_search_with_text_pattern_filter() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"handler","text_pattern":"async"}"#))
+            .unwrap()
+    ).await.unwrap();
+    let body: serde_json::Value = parse_body(response).await;
+    for result in body["results"].as_array().unwrap() {
+        assert!(result["code"].as_str().unwrap().contains("async"));
+    }
+}
+
+#[tokio::test]
+async fn test_search_with_exclude_patterns() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"handler","exclude_patterns":["*_test.rs"]}"#))
+            .unwrap()
+    ).await.unwrap();
+    let body: serde_json::Value = parse_body(response).await;
+    for result in body["results"].as_array().unwrap() {
+        assert!(!result["file"].as_str().unwrap().ends_with("_test.rs"));
+    }
+}
+
+#[tokio::test]
+async fn test_search_with_exclude_dirs() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"handler","exclude_dirs":["vendor"]}"#))
+            .unwrap()
+    ).await.unwrap();
+    let body: serde_json::Value = parse_body(response).await;
+    for result in body["results"].as_array().unwrap() {
+        assert!(!result["file"].as_str().unwrap().starts_with("vendor/"));
+    }
+}
+
+#[tokio::test]
+async fn test_search_code_only_filters_non_code() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"handler","code_only":true}"#))
+            .unwrap()
+    ).await.unwrap();
+    let body: serde_json::Value = parse_body(response).await;
+    for result in body["results"].as_array().unwrap() {
+        let unit_type = result["unit_type"].as_str().unwrap();
+        assert!(unit_type != "document" && unit_type != "comment");
+    }
+}
+
+#[tokio::test]
+async fn test_search_empty_index_returns_empty_results() {
+    let app = create_test_app_empty_index().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"anything"}"#))
+            .unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = parse_body(response).await;
+    assert_eq!(body["results"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_health_empty_index_still_ready() {
+    let app = create_test_app_empty_index().await;
+    let response = app.oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(parse_body(response).await["status"], "ready");
+}
+
+// --- Safety ---
+
+#[tokio::test]
+async fn test_target_path_traversal_rejected() {
+    let app = create_test_app().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"test","target_paths":["../../etc/passwd"]}"#))
+            .unwrap()
+    ).await.unwrap();
+    // Either 400 (rejected) or 200 with empty results (path doesn't exist in index)
+    let status = response.status();
+    assert!(status == StatusCode::BAD_REQUEST || status == StatusCode::OK);
+    if status == StatusCode::OK {
+        let body: serde_json::Value = parse_body(response).await;
+        assert_eq!(body["results"].as_array().unwrap().len(), 0);
+    }
+}
+
+// --- Graceful shutdown ---
+
+#[tokio::test]
+async fn test_graceful_shutdown_completes_inflight() {
+    let app = create_test_app_shared().await;
+    let shutdown_tx = app.shutdown_handle();
+
+    // Start a search
+    let search_handle = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::post("/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"test"}"#))
+                    .unwrap()
+            ).await.unwrap().status()
+        }
+    });
+
+    // Signal shutdown after brief delay
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    shutdown_tx.send(()).unwrap();
+
+    // In-flight search should complete, not get dropped
+    let status = search_handle.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+}
 ```
 
 ### Phase 3b: Targeted Path Search
@@ -1008,7 +1185,10 @@ async fn test_search_target_path_is_faster_than_full() {
     let body_targeted: serde_json::Value = parse_body(resp_targeted).await;
     let time_full = body_full["search_time_ms"].as_u64().unwrap();
     let time_targeted = body_targeted["search_time_ms"].as_u64().unwrap();
-    assert!(time_targeted < time_full, "Targeted {}ms should be faster than full {}ms", time_targeted, time_full);
+    // NOTE: This test may be flaky in CI under load. Consider running as a
+    // benchmark (`cargo bench`) rather than a hard assertion in CI.
+    // Use generous threshold: targeted should be at least 2x faster.
+    assert!(time_targeted * 2 < time_full, "Targeted {}ms should be >2x faster than full {}ms", time_targeted, time_full);
 }
 ```
 
@@ -1075,6 +1255,25 @@ async fn test_request_timeout_returns_408() {
             .unwrap()
     ).await.unwrap();
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+}
+
+#[tokio::test]
+async fn test_onnx_encoding_failure_returns_500_not_crash() {
+    // Mock model that returns error on encode
+    let app = create_test_app_with_failing_model().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"test"}"#))
+            .unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: serde_json::Value = parse_body(response).await;
+    assert!(body["reason"].as_str().unwrap().contains("encoding"));
+
+    // Daemon should still be healthy for subsequent requests
+    let health = app.oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
 }
 ```
 
@@ -1143,6 +1342,32 @@ async fn test_reload_with_missing_index_returns_error() {
     let health = app.oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(health.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_concurrent_reloads_serialized() {
+    let app = create_test_app_shared().await;
+    // Fire 3 reloads simultaneously — all should succeed (serialized by mutex)
+    let mut handles = Vec::new();
+    for _ in 0..3 {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            let response = app.oneshot(
+                Request::post("/reload")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap()
+            ).await.unwrap();
+            response.status()
+        }));
+    }
+    let statuses: Vec<StatusCode> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+    // All should succeed (serialized), none should 500
+    assert!(statuses.iter().all(|s| *s == StatusCode::OK));
+}
 ```
 
 ### Phase 6: Pre-warming & Startup Performance
@@ -1168,6 +1393,15 @@ fn test_prewarm_skipped_with_no_prewarm_flag() {
     let config = ServeConfig { no_prewarm: true, ..default() };
     let state = AppState::new_with_config(test_index_path(), config).unwrap();
     // Should succeed without pre-warming
+    assert_eq!(state.health().status, "ready");
+}
+
+#[test]
+fn test_prewarm_failure_is_non_fatal() {
+    // Prewarm on a path where mmap files are missing/unreadable
+    // Should log warning but not prevent startup
+    let config = ServeConfig { no_prewarm: false, ..default() };
+    let state = AppState::new_with_config(test_index_path_partial(), config).unwrap();
     assert_eq!(state.health().status, "ready");
 }
 
@@ -1236,6 +1470,22 @@ async fn test_search_alpha_out_of_range_returns_400() {
             .unwrap()
     ).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_hybrid_search_fallback_when_fts5_missing() {
+    // Create app with index that has no FTS5 tables (pre-v1.2.0 index)
+    let app = create_test_app_no_fts5().await;
+    let response = app.oneshot(
+        Request::post("/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"handler"}"#))
+            .unwrap()
+    ).await.unwrap();
+    // Should still succeed with pure semantic search, not 500
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = parse_body(response).await;
+    assert_eq!(body["hybrid_mode"], false); // fell back to semantic-only
 }
 ```
 
