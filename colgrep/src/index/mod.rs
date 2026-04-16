@@ -840,7 +840,7 @@ impl IndexBuilder {
     }
 
     pub fn set_chunk_files(&mut self, n: usize) {
-        self.chunk_files = n;
+        self.chunk_files = n.max(1);
         self.chunked = true;
     }
 
@@ -1326,13 +1326,13 @@ impl IndexBuilder {
         // Need full rebuild if forced, index doesn't exist, filtering DB is missing,
         // or CLI version changed
         if force || !index_exists || !filtering_exists || version_mismatch {
-            return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) };
+            return self.dispatch_full_rebuild(languages);
         }
 
         // Validate filtering DB is not corrupted (can be read)
         if filtering::count(index_path).is_err() {
             eprintln!("⚠️  Filtering database corrupted, rebuilding index...");
-            return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) };
+            return self.dispatch_full_rebuild(languages);
         }
 
         // State is out of sync with index (e.g., state.json was deleted but index exists)
@@ -1349,7 +1349,7 @@ impl IndexBuilder {
                 }
                 Err(_) => {
                     // Failed to reconstruct, fall back to full rebuild
-                    return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) };
+                    return self.dispatch_full_rebuild(languages);
                 }
             }
         } else {
@@ -1375,7 +1375,7 @@ impl IndexBuilder {
                         }
                         Err(_) => {
                             // Failed to reconcile, fall back to full rebuild
-                            return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) };
+                            return self.dispatch_full_rebuild(languages);
                         }
                     }
                 }
@@ -1412,12 +1412,12 @@ impl IndexBuilder {
             index_exists && !state.cli_version.is_empty() && state.cli_version != current_version;
 
         if force || !index_exists || !filtering_exists || version_mismatch {
-            return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) }.map(Some);
+            return self.dispatch_full_rebuild(languages).map(Some);
         }
 
         if filtering::count(index_path).is_err() {
             eprintln!("⚠️  Filtering database corrupted, rebuilding index...");
-            return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) }.map(Some);
+            return self.dispatch_full_rebuild(languages).map(Some);
         }
 
         let state = if state.files.is_empty() {
@@ -1431,7 +1431,7 @@ impl IndexBuilder {
                     reconstructed
                 }
                 Err(_) => {
-                    return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) }.map(Some);
+                    return self.dispatch_full_rebuild(languages).map(Some);
                 }
             }
         } else {
@@ -1453,7 +1453,7 @@ impl IndexBuilder {
                             );
                         }
                         Err(_) => {
-                            return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) }.map(Some);
+                            return self.dispatch_full_rebuild(languages).map(Some);
                         }
                     }
                 }
@@ -1679,6 +1679,14 @@ impl IndexBuilder {
             .collect();
 
         Ok(filtered)
+    }
+
+    fn dispatch_full_rebuild(&mut self, languages: Option<&[Language]>) -> Result<UpdateStats> {
+        if self.chunked {
+            self.full_rebuild_chunked(languages)
+        } else {
+            self.full_rebuild(languages)
+        }
     }
 
     /// Full rebuild (used when force=true or no index exists)
@@ -1987,7 +1995,7 @@ impl IndexBuilder {
         if old_state.dirty {
             if let Err(e) = self.repair_index_db_sync(&index_dir) {
                 eprintln!("⚠️  Repair failed: {}, falling back to full rebuild", e);
-                return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) };
+                return self.dispatch_full_rebuild(languages);
             }
         }
 
