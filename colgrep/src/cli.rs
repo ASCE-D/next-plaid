@@ -589,6 +589,14 @@ pub enum Commands {
         /// Use strict batch-size batching instead of fixed dynamic GPU batching
         #[arg(long = "static-batch")]
         static_batch: bool,
+
+        /// Enable chunked indexing for large repos (processes files in bounded groups to limit memory)
+        #[arg(long = "chunked")]
+        chunked: bool,
+
+        /// Number of files per chunk in chunked indexing mode (default: 10000)
+        #[arg(long = "chunk-files", value_name = "N", requires = "chunked")]
+        chunk_files: Option<usize>,
     },
 
     /// View or set configuration options (default k, n values)

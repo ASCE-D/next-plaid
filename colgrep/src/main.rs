@@ -224,6 +224,8 @@ fn main() -> Result<()> {
             encode_batch_size,
             index_chunk_size,
             static_batch,
+            chunked,
+            chunk_files,
         }) => cmd_init(
             &path,
             InitOptions {
@@ -235,6 +237,8 @@ fn main() -> Result<()> {
                 encode_batch_size,
                 index_chunk_size,
                 static_batch,
+                chunked,
+                chunk_files,
             },
         ),
         Some(Commands::Serve {

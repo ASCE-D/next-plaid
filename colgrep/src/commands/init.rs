@@ -14,6 +14,8 @@ pub struct InitOptions<'a> {
     pub encode_batch_size: Option<usize>,
     pub index_chunk_size: Option<usize>,
     pub static_batch: bool,
+    pub chunked: bool,
+    pub chunk_files: Option<usize>,
 }
 
 pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
@@ -58,6 +60,12 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
     }
     if let Some(index_chunk_size) = options.index_chunk_size {
         builder.set_index_chunk_size(index_chunk_size.max(1));
+    }
+    if options.chunked {
+        builder.set_chunked(true);
+    }
+    if let Some(n) = options.chunk_files {
+        builder.set_chunk_files(n);
     }
     let stats = builder.index(None, false)?;
 

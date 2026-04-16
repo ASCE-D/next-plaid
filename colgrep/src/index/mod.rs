@@ -122,6 +122,9 @@ const LARGE_BATCH_POOL_FACTOR: usize = 2;
 
 const DEFAULT_ENCODE_BATCH_SIZE: usize = 64;
 
+/// Default number of files per chunk in chunked indexing mode.
+const DEFAULT_CHUNK_FILES: usize = 10_000;
+
 /// Threshold for forcing CPU encoding even when CUDA is available.
 /// For small batches (< this many units), CPU is faster due to GPU initialization overhead.
 #[cfg(feature = "cuda")]
@@ -765,6 +768,10 @@ pub struct IndexBuilder {
     auto_confirm: bool,
     /// Model name/id for display (e.g., "lightonai/LateOn-Code-edge")
     model_name: Option<String>,
+    /// If true, use chunked indexing (process files in bounded groups)
+    chunked: bool,
+    /// Number of files per chunk (default: 10_000)
+    chunk_files: usize,
 }
 
 impl IndexBuilder {
@@ -801,6 +808,8 @@ impl IndexBuilder {
             dynamic_batch: true,
             auto_confirm: false, // Prompt by default for large indexes
             model_name: None,
+            chunked: false,
+            chunk_files: DEFAULT_CHUNK_FILES,
         })
     }
 
@@ -824,6 +833,15 @@ impl IndexBuilder {
 
     pub fn set_dynamic_batch(&mut self, dynamic_batch: bool) {
         self.dynamic_batch = dynamic_batch;
+    }
+
+    pub fn set_chunked(&mut self, chunked: bool) {
+        self.chunked = chunked;
+    }
+
+    pub fn set_chunk_files(&mut self, n: usize) {
+        self.chunk_files = n;
+        self.chunked = true;
     }
 
     /// Ensure the model is created for encoding.
