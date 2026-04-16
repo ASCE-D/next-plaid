@@ -2557,7 +2557,7 @@ impl IndexBuilder {
             let pb = ProgressBar::new(units.len() as u64);
             pb.set_style(
                 ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                    .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
                     .unwrap()
                     .progress_chars("█▓░"),
             );
