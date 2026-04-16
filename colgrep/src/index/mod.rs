@@ -225,6 +225,10 @@ struct ChunkPipelineConfig<'a> {
     config: IndexConfig,
     update_config: UpdateConfig,
     pb: Option<&'a ProgressBar>,
+    /// Optional progress bar whose *message* is updated with encoding counts
+    /// (e.g., "Wave 1: Encoding 5000/20000 units..."). Used in chunked mode
+    /// where the primary pb is the file-level bar.
+    message_pb: Option<ProgressBar>,
 }
 
 /// Embeddings waiting to be compressed and written to the PLAID index.
@@ -520,6 +524,8 @@ fn run_metadata_stage(
     receiver: mpsc::Receiver<IndexedChunkForMetadata>,
     index_path: String,
     pb: Option<ProgressBar>,
+    message_pb: Option<ProgressBar>,
+    total_units: u64,
 ) -> Result<()> {
     let mut filtering_exists = filtering::exists(&index_path);
     let mut completed_units = 0u64;
@@ -559,6 +565,9 @@ fn run_metadata_stage(
         if let Some(pb) = pb.as_ref() {
             pb.set_position(completed_units);
         }
+        if let Some(mpb) = message_pb.as_ref() {
+            mpb.set_message(format!("Encoding {completed_units}/{total_units} units..."));
+        }
     }
 
     Ok(())
@@ -585,6 +594,7 @@ fn run_chunk_pipeline(
         config,
         update_config,
         pb,
+        message_pb,
     } = pipeline;
 
     let (tokenize_tx, tokenize_rx) = mpsc::channel::<PreparedChunk>();
@@ -625,9 +635,18 @@ fn run_chunk_pipeline(
         .context("Failed to spawn index stage thread")?;
     let index_path_for_metadata = index_path.to_string();
     let metadata_pb = pb.cloned();
+    let total_units = sorted_units.len() as u64;
     let metadata_handle = thread::Builder::new()
         .name("colgrep-metadata".to_string())
-        .spawn(move || run_metadata_stage(metadata_rx, index_path_for_metadata, metadata_pb))
+        .spawn(move || {
+            run_metadata_stage(
+                metadata_rx,
+                index_path_for_metadata,
+                metadata_pb,
+                message_pb,
+                total_units,
+            )
+        })
         .context("Failed to spawn metadata stage thread")?;
 
     for unit_chunk in sorted_units.chunks(index_chunk_size) {
@@ -1050,6 +1069,7 @@ impl IndexBuilder {
         pool_factor: Option<usize>,
         index_path: &str,
         pb: Option<&ProgressBar>,
+        message_pb: Option<ProgressBar>,
     ) -> Result<bool> {
         let force_cpu = next_plaid::is_force_cpu();
         let config = IndexConfig {
@@ -1071,6 +1091,7 @@ impl IndexBuilder {
                 config,
                 update_config,
                 pb,
+                message_pb,
             },
         );
 
@@ -1117,6 +1138,7 @@ impl IndexBuilder {
                         config,
                         update_config,
                         pb,
+                        message_pb: None,
                     },
                 );
             }
@@ -1644,6 +1666,7 @@ impl IndexBuilder {
             pool_factor,
             index_path,
             Some(&pb),
+            None,
         )?;
 
         pb.finish_and_clear();
@@ -1764,7 +1787,7 @@ impl IndexBuilder {
             }
 
             // Build new index in temp directory to avoid destroying the old one
-            self.write_index_impl(&all_units, true, Some(&temp_path))?
+            self.write_index_impl(&all_units, true, Some(&temp_path), None)?
         } else {
             false
         };
@@ -1928,8 +1951,15 @@ impl IndexBuilder {
                 wave_units.len()
             ));
 
-            let was_interrupted =
-                self.write_index_impl(&wave_units, true, Some(&target_index_path))?;
+            // Pass show_progress=false to avoid a second progress bar
+            // flickering against the file-level bar above. Instead, pass
+            // file_pb as message_pb so encoding progress updates its message.
+            let was_interrupted = self.write_index_impl(
+                &wave_units,
+                false,
+                Some(&target_index_path),
+                Some(file_pb.clone()),
+            )?;
 
             if was_interrupted {
                 let _ = std::fs::remove_dir_all(&temp_path);
@@ -2156,6 +2186,7 @@ impl IndexBuilder {
                 pool_factor,
                 index_path,
                 Some(&pb),
+                None,
             )?;
             was_interrupted |= pipeline_interrupted;
 
@@ -2540,12 +2571,12 @@ impl IndexBuilder {
 
     #[allow(dead_code)]
     fn write_index(&mut self, units: &[CodeUnit]) -> Result<bool> {
-        self.write_index_impl(units, false, None)
+        self.write_index_impl(units, false, None, None)
     }
 
     #[allow(dead_code)]
     fn write_index_with_progress(&mut self, units: &[CodeUnit]) -> Result<bool> {
-        self.write_index_impl(units, true, None)
+        self.write_index_impl(units, true, None, None)
     }
 
     fn write_index_impl(
@@ -2553,6 +2584,7 @@ impl IndexBuilder {
         units: &[CodeUnit],
         show_progress: bool,
         target_index_path: Option<&Path>,
+        message_pb: Option<ProgressBar>,
     ) -> Result<bool> {
         let index_dir = target_index_path
             .map(|p| p.to_path_buf())
@@ -2593,6 +2625,7 @@ impl IndexBuilder {
             pool_factor,
             index_path,
             pb.as_ref(),
+            message_pb,
         )?;
 
         if let Some(pb) = pb {
