@@ -1326,13 +1326,13 @@ impl IndexBuilder {
         // Need full rebuild if forced, index doesn't exist, filtering DB is missing,
         // or CLI version changed
         if force || !index_exists || !filtering_exists || version_mismatch {
-            return self.full_rebuild(languages);
+            return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) };
         }
 
         // Validate filtering DB is not corrupted (can be read)
         if filtering::count(index_path).is_err() {
             eprintln!("⚠️  Filtering database corrupted, rebuilding index...");
-            return self.full_rebuild(languages);
+            return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) };
         }
 
         // State is out of sync with index (e.g., state.json was deleted but index exists)
@@ -1349,7 +1349,7 @@ impl IndexBuilder {
                 }
                 Err(_) => {
                     // Failed to reconstruct, fall back to full rebuild
-                    return self.full_rebuild(languages);
+                    return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) };
                 }
             }
         } else {
@@ -1375,7 +1375,7 @@ impl IndexBuilder {
                         }
                         Err(_) => {
                             // Failed to reconcile, fall back to full rebuild
-                            return self.full_rebuild(languages);
+                            return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) };
                         }
                     }
                 }
@@ -1412,12 +1412,12 @@ impl IndexBuilder {
             index_exists && !state.cli_version.is_empty() && state.cli_version != current_version;
 
         if force || !index_exists || !filtering_exists || version_mismatch {
-            return self.full_rebuild(languages).map(Some);
+            return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) }.map(Some);
         }
 
         if filtering::count(index_path).is_err() {
             eprintln!("⚠️  Filtering database corrupted, rebuilding index...");
-            return self.full_rebuild(languages).map(Some);
+            return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) }.map(Some);
         }
 
         let state = if state.files.is_empty() {
@@ -1431,7 +1431,7 @@ impl IndexBuilder {
                     reconstructed
                 }
                 Err(_) => {
-                    return self.full_rebuild(languages).map(Some);
+                    return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) }.map(Some);
                 }
             }
         } else {
@@ -1453,7 +1453,7 @@ impl IndexBuilder {
                             );
                         }
                         Err(_) => {
-                            return self.full_rebuild(languages).map(Some);
+                            return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) }.map(Some);
                         }
                     }
                 }
@@ -1806,6 +1806,173 @@ impl IndexBuilder {
         })
     }
 
+    /// Chunked full rebuild: processes files in bounded waves to limit memory.
+    ///
+    /// Each wave: scan chunk of files -> parse -> build call graph -> encode -> flush to index.
+    /// The PLAID index is built incrementally via update_or_create after the first wave
+    /// seeds the k-means centroids.
+    ///
+    /// Trade-off: call graph edges only connect units within the same wave.
+    fn full_rebuild_chunked(&mut self, languages: Option<&[Language]>) -> Result<UpdateStats> {
+        let index_path = get_vector_index_path(&self.index_dir);
+        let temp_path = self.index_dir.join("index.tmp");
+        let old_path = self.index_dir.join("index.old");
+
+        // Clean any leftover temp/old dirs from previous failed attempts
+        if temp_path.exists() {
+            std::fs::remove_dir_all(&temp_path)?;
+        }
+        if old_path.exists() {
+            std::fs::remove_dir_all(&old_path)?;
+        }
+
+        let (files, skipped) = self.scan_files(languages)?;
+        let total_files = files.len();
+        let mut state = IndexState::default();
+        let mut total_units: usize = 0;
+        let mut first_wave = true;
+
+        // Overall progress bar (file-level, across all waves)
+        let file_pb = ProgressBar::new(total_files as u64);
+        file_pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+                .unwrap()
+                .progress_chars("█▓░"),
+        );
+        file_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        let chunk_files = self.chunk_files;
+        let target_index_path = temp_path.clone();
+        std::fs::create_dir_all(&target_index_path)?;
+
+        for (wave_idx, file_chunk) in files.chunks(chunk_files).enumerate() {
+            if is_interrupted() {
+                let _ = std::fs::remove_dir_all(&temp_path);
+                anyhow::bail!("Indexing interrupted by user");
+            }
+
+            file_pb.set_message(format!(
+                "Wave {}: Parsing files...",
+                wave_idx + 1
+            ));
+
+            // 1. Parse this wave's files
+            let mut wave_units: Vec<CodeUnit> = Vec::new();
+            for parsed in parse_files_parallel(&self.project_root, file_chunk, Some(&file_pb)) {
+                if let Some(reason) = parsed.skip_reason {
+                    eprintln!("⚠️  {}", reason);
+                    state.ignored_files.insert(parsed.path);
+                    continue;
+                }
+
+                wave_units.extend(parsed.units);
+                state.ignored_files.remove(&parsed.path);
+                if let Some(file_info) = parsed.file_info {
+                    state.files.insert(parsed.path, file_info);
+                }
+            }
+
+            if is_interrupted() {
+                let _ = std::fs::remove_dir_all(&temp_path);
+                anyhow::bail!("Indexing interrupted by user");
+            }
+
+            if wave_units.is_empty() {
+                continue;
+            }
+
+            // 2. Build call graph within this wave
+            build_call_graph(&mut wave_units);
+
+            // 3. Prompt for confirmation on the first wave (total estimate)
+            if first_wave && !self.auto_confirm {
+                // Estimate total units from first wave
+                let estimated_total =
+                    (wave_units.len() as f64 / file_chunk.len() as f64 * total_files as f64) as usize;
+                if estimated_total > CONFIRMATION_THRESHOLD
+                    && !prompt_large_index_confirmation(estimated_total)
+                {
+                    let _ = std::fs::remove_dir_all(&temp_path);
+                    anyhow::bail!("Indexing cancelled by user");
+                }
+            }
+
+            total_units += wave_units.len();
+
+            // 4. Ensure model is created (lazy init on first wave)
+            if first_wave {
+                self.ensure_model_created(wave_units.len())?;
+
+                #[cfg(feature = "cuda")]
+                if !crate::onnx_runtime::is_cudnn_available()
+                    && std::env::var("_COLGREP_CUDNN_NOTICE").is_err()
+                {
+                    std::env::set_var("_COLGREP_CUDNN_NOTICE", "1");
+                    eprintln!("📂 cuDNN not found, encoding will use CPU.");
+                }
+            }
+
+            // 5. Encode and write to index
+            file_pb.set_message(format!(
+                "Wave {}: Encoding {} units...",
+                wave_idx + 1,
+                wave_units.len()
+            ));
+
+            let was_interrupted =
+                self.write_index_impl(&wave_units, true, Some(&target_index_path))?;
+
+            if was_interrupted {
+                let _ = std::fs::remove_dir_all(&temp_path);
+                anyhow::bail!("Indexing interrupted by user");
+            }
+
+            // Units are now flushed to disk — drop them to free memory
+            drop(wave_units);
+
+            first_wave = false;
+        }
+
+        file_pb.finish_and_clear();
+
+        // Atomic swap: replace old index with newly built one
+        if total_units == 0 {
+            if index_path.exists() {
+                std::fs::remove_dir_all(&index_path)?;
+            }
+        } else {
+            if index_path.exists() {
+                std::fs::rename(&index_path, &old_path)
+                    .context("Failed to move old index aside")?;
+            }
+            if let Err(e) = std::fs::rename(&temp_path, &index_path) {
+                if old_path.exists() && !index_path.exists() {
+                    let _ = std::fs::rename(&old_path, &index_path);
+                }
+                return Err(anyhow::anyhow!(
+                    "Failed to move new index into place: {}",
+                    e
+                ));
+            }
+            if old_path.exists() {
+                let _ = std::fs::remove_dir_all(&old_path);
+            }
+        }
+
+        // Save state and project metadata only on successful completion
+        state.save(&self.index_dir)?;
+        ProjectMetadata::new(&self.project_root).save(&self.index_dir)?;
+
+        Ok(UpdateStats {
+            added: total_files,
+            changed: 0,
+            deleted: 0,
+            unchanged: 0,
+            skipped,
+        })
+    }
+
     /// Incremental update (only re-index changed files)
     fn incremental_update(
         &mut self,
@@ -1820,7 +1987,7 @@ impl IndexBuilder {
         if old_state.dirty {
             if let Err(e) = self.repair_index_db_sync(&index_dir) {
                 eprintln!("⚠️  Repair failed: {}, falling back to full rebuild", e);
-                return self.full_rebuild(languages);
+                return if self.chunked { self.full_rebuild_chunked(languages) } else { self.full_rebuild(languages) };
             }
         }
 
