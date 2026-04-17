@@ -597,6 +597,10 @@ pub enum Commands {
         /// Number of files per chunk in chunked indexing mode (default: 10000)
         #[arg(long = "chunk-files", value_name = "N", requires = "chunked")]
         chunk_files: Option<usize>,
+
+        /// Skip resuming from a previous chunked indexing checkpoint (force fresh start)
+        #[arg(long = "no-resume")]
+        no_resume: bool,
     },
 
     /// View or set configuration options (default k, n values)

@@ -226,6 +226,7 @@ fn main() -> Result<()> {
             static_batch,
             chunked,
             chunk_files,
+            no_resume,
         }) => cmd_init(
             &path,
             InitOptions {
@@ -239,6 +240,7 @@ fn main() -> Result<()> {
                 static_batch,
                 chunked,
                 chunk_files,
+                no_resume,
             },
         ),
         Some(Commands::Serve {

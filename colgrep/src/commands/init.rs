@@ -16,6 +16,7 @@ pub struct InitOptions<'a> {
     pub static_batch: bool,
     pub chunked: bool,
     pub chunk_files: Option<usize>,
+    pub no_resume: bool,
 }
 
 pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
@@ -66,6 +67,9 @@ pub fn cmd_init(path: &PathBuf, options: InitOptions<'_>) -> Result<()> {
     }
     if let Some(n) = options.chunk_files {
         builder.set_chunk_files(n);
+    }
+    if options.no_resume {
+        builder.set_no_resume(true);
     }
     let stats = builder.index(None, false)?;
 

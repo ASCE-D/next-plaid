@@ -792,6 +792,8 @@ pub struct IndexBuilder {
     chunked: bool,
     /// Number of files per chunk (default: 10_000)
     chunk_files: usize,
+    /// If true, ignore any existing checkpoint and start fresh
+    no_resume: bool,
 }
 
 impl IndexBuilder {
@@ -830,6 +832,7 @@ impl IndexBuilder {
             model_name: None,
             chunked: false,
             chunk_files: DEFAULT_CHUNK_FILES,
+            no_resume: false,
         })
     }
 
@@ -862,6 +865,10 @@ impl IndexBuilder {
     pub fn set_chunk_files(&mut self, n: usize) {
         self.chunk_files = n.max(1);
         self.chunked = true;
+    }
+
+    pub fn set_no_resume(&mut self, no_resume: bool) {
+        self.no_resume = no_resume;
     }
 
     /// Ensure the model is created for encoding.
