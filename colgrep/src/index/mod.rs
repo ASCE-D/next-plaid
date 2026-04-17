@@ -1338,9 +1338,13 @@ impl IndexBuilder {
     pub fn index(&mut self, languages: Option<&[Language]>, force: bool) -> Result<UpdateStats> {
         let _lock = acquire_index_lock(&self.index_dir)?;
 
-        // Clean up any leftover temp/old dirs from previous failed full rebuilds
-        let _ = std::fs::remove_dir_all(self.index_dir.join("index.tmp"));
-        let _ = std::fs::remove_dir_all(self.index_dir.join("index.old"));
+        // Clean up any leftover temp/old dirs from previous failed full rebuilds.
+        // Skip cleanup when chunked mode is active — index.tmp may contain a
+        // valid checkpoint from a previous interrupted run.
+        if !self.chunked {
+            let _ = std::fs::remove_dir_all(self.index_dir.join("index.tmp"));
+            let _ = std::fs::remove_dir_all(self.index_dir.join("index.old"));
+        }
 
         let state = IndexState::load(&self.index_dir)?;
         let index_dir = get_vector_index_path(&self.index_dir);
@@ -1427,9 +1431,13 @@ impl IndexBuilder {
             return Ok(None);
         };
 
-        // Clean up any leftover temp/old dirs from previous failed full rebuilds
-        let _ = std::fs::remove_dir_all(self.index_dir.join("index.tmp"));
-        let _ = std::fs::remove_dir_all(self.index_dir.join("index.old"));
+        // Clean up any leftover temp/old dirs from previous failed full rebuilds.
+        // Skip cleanup when chunked mode is active — index.tmp may contain a
+        // valid checkpoint from a previous interrupted run.
+        if !self.chunked {
+            let _ = std::fs::remove_dir_all(self.index_dir.join("index.tmp"));
+            let _ = std::fs::remove_dir_all(self.index_dir.join("index.old"));
+        }
 
         let state = IndexState::load(&self.index_dir)?;
         let index_dir = get_vector_index_path(&self.index_dir);
