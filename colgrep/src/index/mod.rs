@@ -1,3 +1,4 @@
+pub mod checkpoint;
 pub mod paths;
 pub mod state;
 pub mod storage;
