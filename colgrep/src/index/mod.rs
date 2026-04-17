@@ -1857,19 +1857,47 @@ impl IndexBuilder {
         let temp_path = self.index_dir.join("index.tmp");
         let old_path = self.index_dir.join("index.old");
 
-        // Clean any leftover temp/old dirs from previous failed attempts
-        if temp_path.exists() {
-            std::fs::remove_dir_all(&temp_path)?;
-        }
-        if old_path.exists() {
-            std::fs::remove_dir_all(&old_path)?;
-        }
-
         let (files, skipped) = self.scan_files(languages)?;
         let total_files = files.len();
         let mut state = IndexState::default();
         let mut total_units: usize = 0;
         let mut first_wave = true;
+
+        let mut start_wave: usize = 0;
+        let chunk_files = self.chunk_files;
+        let target_index_path = temp_path.clone();
+
+        // Check for existing checkpoint to resume from
+        if !self.no_resume {
+            if let Ok(Some(ckpt)) = checkpoint::ChunkedCheckpoint::load(&target_index_path) {
+                if ckpt.is_valid_for(&files, chunk_files) && ckpt.completed_waves > 0 {
+                    eprintln!(
+                        "📂 Resuming from wave {} ({} files, {} units already encoded)",
+                        ckpt.completed_waves + 1,
+                        ckpt.completed_waves * chunk_files,
+                        ckpt.total_units,
+                    );
+                    start_wave = ckpt.completed_waves;
+                    state = ckpt.state;
+                    total_units = ckpt.total_units;
+                    first_wave = false;
+                } else if ckpt.completed_waves > 0 {
+                    eprintln!("⚠️  Stale checkpoint found (parameters changed), starting fresh");
+                    checkpoint::ChunkedCheckpoint::cleanup(&target_index_path);
+                }
+            }
+        }
+
+        // Only clean temp/old dirs if starting fresh (no valid checkpoint to resume)
+        if start_wave == 0 {
+            if temp_path.exists() {
+                std::fs::remove_dir_all(&temp_path)?;
+            }
+            if old_path.exists() {
+                std::fs::remove_dir_all(&old_path)?;
+            }
+        }
+        std::fs::create_dir_all(&target_index_path)?;
 
         // Overall progress bar (file-level, across all waves)
         let file_pb = ProgressBar::new(total_files as u64);
@@ -1881,13 +1909,18 @@ impl IndexBuilder {
         );
         file_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-        let chunk_files = self.chunk_files;
-        let target_index_path = temp_path.clone();
-        std::fs::create_dir_all(&target_index_path)?;
+        if start_wave > 0 {
+            let completed_files = (start_wave * chunk_files).min(total_files);
+            file_pb.set_position(completed_files as u64);
+        }
 
         for (wave_idx, file_chunk) in files.chunks(chunk_files).enumerate() {
+            // Skip waves already completed in a previous run
+            if wave_idx < start_wave {
+                continue;
+            }
+
             if is_interrupted() {
-                let _ = std::fs::remove_dir_all(&temp_path);
                 anyhow::bail!("Indexing interrupted by user");
             }
 
@@ -1913,7 +1946,6 @@ impl IndexBuilder {
             }
 
             if is_interrupted() {
-                let _ = std::fs::remove_dir_all(&temp_path);
                 anyhow::bail!("Indexing interrupted by user");
             }
 
@@ -1932,7 +1964,6 @@ impl IndexBuilder {
                 if estimated_total > CONFIRMATION_THRESHOLD
                     && !prompt_large_index_confirmation(estimated_total)
                 {
-                    let _ = std::fs::remove_dir_all(&temp_path);
                     anyhow::bail!("Indexing cancelled by user");
                 }
             }
@@ -1970,12 +2001,24 @@ impl IndexBuilder {
             )?;
 
             if was_interrupted {
-                let _ = std::fs::remove_dir_all(&temp_path);
                 anyhow::bail!("Indexing interrupted by user");
             }
 
             // Units are now flushed to disk — drop them to free memory
             drop(wave_units);
+
+            // Save checkpoint so this wave can be skipped on resume
+            let ckpt = checkpoint::ChunkedCheckpoint {
+                completed_waves: wave_idx + 1,
+                chunk_files,
+                file_list_hash: checkpoint::ChunkedCheckpoint::hash_file_list(&files),
+                total_files,
+                state: state.clone(),
+                total_units,
+            };
+            if let Err(e) = ckpt.save(&target_index_path) {
+                eprintln!("⚠️  Failed to save checkpoint: {e}");
+            }
 
             first_wave = false;
         }
@@ -2009,6 +2052,9 @@ impl IndexBuilder {
         // Save state and project metadata only on successful completion
         state.save(&self.index_dir)?;
         ProjectMetadata::new(&self.project_root).save(&self.index_dir)?;
+
+        // Checkpoint no longer needed — index is complete
+        checkpoint::ChunkedCheckpoint::cleanup(&index_path);
 
         Ok(UpdateStats {
             added: total_files,
