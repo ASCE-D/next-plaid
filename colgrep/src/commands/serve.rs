@@ -50,9 +50,12 @@ struct AppState {
 }
 
 fn format_result(r: &SearchResult) -> serde_json::Value {
+    let file_str = r.unit.file.display().to_string();
     serde_json::json!({
-        "file": r.unit.file.display().to_string(),
+        "file": file_str,
+        "path": file_str,
         "line": r.unit.line,
+        "start_line": r.unit.line,
         "end_line": r.unit.end_line,
         "score": (r.score * 1000.0).round() / 1000.0,
         "unit_type": serde_json::to_value(&r.unit.unit_type).unwrap_or_default(),
@@ -263,6 +266,7 @@ async fn search_handler(
                 Json(serde_json::json!({
                     "results": formatted,
                     "search_time_ms": search_time_ms,
+                    "latency_ms": search_time_ms,
                     "index_doc_count": doc_count,
                     "hybrid_mode": hybrid_mode,
                 })),
