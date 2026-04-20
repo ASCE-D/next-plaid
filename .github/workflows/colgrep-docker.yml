@@ -1,0 +1,85 @@
+name: Build & Push ColGREP Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Build target'
+        required: true
+        default: 'cpu'
+        type: choice
+        options:
+          - cpu
+          - cuda
+      tag:
+        description: 'Image tag (default: git SHA short)'
+        required: false
+        type: string
+
+  push:
+    branches:
+      - feat/colgrep-daemon-with-local-changes
+    paths:
+      - 'colgrep/**'
+      - 'next-plaid/**'
+      - 'next-plaid-onnx/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'colgrep/Dockerfile'
+
+env:
+  GAR_LOCATION: us-central1
+  GAR_REPO: colgrep
+  GCP_PROJECT: staging-433102
+  IMAGE_NAME: colgrep
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set build target
+        id: target
+        run: |
+          TARGET="${{ inputs.target || 'cpu' }}"
+          echo "target=runtime-${TARGET}" >> $GITHUB_OUTPUT
+          echo "suffix=${TARGET}" >> $GITHUB_OUTPUT
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: colgrep/Dockerfile
+          target: ${{ steps.target.outputs.target }}
+          push: true
+          tags: |
+            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GAR_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}-${{ steps.target.outputs.suffix }}
+            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.GAR_REPO }}/${{ env.IMAGE_NAME }}:latest-${{ steps.target.outputs.suffix }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
