@@ -344,8 +344,6 @@ impl ResidualCodec {
     ///
     /// Packed residuals of shape `[N, dim * nbits / 8]` as bytes
     pub fn quantize_residuals(&self, residuals: &Array2<f32>) -> Result<Array2<u8>> {
-        use rayon::prelude::*;
-
         let cutoffs = self
             .bucket_cutoffs
             .as_ref()
@@ -360,8 +358,56 @@ impl ResidualCodec {
             return Ok(Array2::zeros((0, packed_dim)));
         }
 
-        // Convert cutoffs to a slice for faster access
         let cutoffs_slice = cutoffs.as_slice().unwrap();
+
+        // Try CUDA path first (if available and not force_cpu)
+        #[cfg(feature = "cuda")]
+        {
+            let force_cpu = crate::is_force_cpu();
+            if !force_cpu {
+                if let Some(ctx) = crate::cuda::get_global_context() {
+                    match crate::cuda::quantize_residuals_cuda(
+                        &ctx,
+                        &residuals.view(),
+                        cutoffs_slice,
+                        nbits,
+                    ) {
+                        Ok(result) => return Ok(result),
+                        Err(e) => {
+                            if crate::is_force_gpu() {
+                                return Err(Error::Codec(format!(
+                                    "FORCE_GPU is set but CUDA quantize_residuals failed: {}",
+                                    e
+                                )));
+                            }
+                            eprintln!(
+                                "[next-plaid] CUDA quantize_residuals failed: {}, falling back to CPU",
+                                e
+                            );
+                        }
+                    }
+                } else if crate::is_force_gpu() {
+                    return Err(Error::Codec(
+                        "FORCE_GPU is set but CUDA context is unavailable for quantize_residuals"
+                            .into(),
+                    ));
+                }
+            }
+        }
+
+        // CPU fallback path
+        Self::quantize_residuals_cpu(residuals, cutoffs_slice, nbits, packed_dim)
+    }
+
+    fn quantize_residuals_cpu(
+        residuals: &Array2<f32>,
+        cutoffs_slice: &[f32],
+        nbits: usize,
+        packed_dim: usize,
+    ) -> Result<Array2<u8>> {
+        use rayon::prelude::*;
+
+        let n = residuals.nrows();
 
         // Process rows in parallel
         let packed_rows: Vec<Vec<u8>> = residuals

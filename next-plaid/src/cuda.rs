@@ -62,6 +62,7 @@ pub struct CudaContext {
     pub blas: CudaBlas,
     argmax_func: CudaFunction,
     gather_subtract_func: CudaFunction,
+    quantize_func: CudaFunction,
 }
 
 impl CudaContext {
@@ -81,7 +82,7 @@ impl CudaContext {
             .map_err(|e| Error::Codec(format!("Failed to initialize cuBLAS: {:?}", e)))?;
 
         // Preload PTX kernels during context creation
-        let (argmax_func, gather_subtract_func) = load_kernels(&device)?;
+        let (argmax_func, gather_subtract_func, quantize_func) = load_kernels(&device)?;
 
         Ok(Self {
             device,
@@ -89,6 +90,7 @@ impl CudaContext {
             blas,
             argmax_func,
             gather_subtract_func,
+            quantize_func,
         })
     }
 }
@@ -231,6 +233,58 @@ extern "C" __global__ void gather_subtract_kernel(
         res_row[d] = emb_row[d] - cent_row[d];
     }
 }
+
+// Quantize residuals kernel - bucketize each float value and bit-pack into u8 output.
+// Each thread processes one row of the residuals matrix.
+// cutoffs is a small array (e.g., 3 elements for nbits=2) loaded into shared memory.
+extern "C" __global__ void quantize_residuals_kernel(
+    const float* residuals,    // [num_rows, dim]
+    unsigned char* packed,     // [num_rows, packed_dim]
+    const float* cutoffs,      // [num_cutoffs]
+    int num_rows,
+    int dim,
+    int packed_dim,
+    int nbits,
+    int num_cutoffs
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= num_rows) return;
+
+    // Load cutoffs into shared memory (small, shared across all threads in block)
+    extern __shared__ float s_cutoffs[];
+    if (threadIdx.x < num_cutoffs) {
+        s_cutoffs[threadIdx.x] = cutoffs[threadIdx.x];
+    }
+    __syncthreads();
+
+    const float* res_row = residuals + (long long)row * dim;
+    unsigned char* out_row = packed + (long long)row * packed_dim;
+
+    // Zero output first
+    for (int i = 0; i < packed_dim; i++) {
+        out_row[i] = 0;
+    }
+
+    int bit_idx = 0;
+    for (int d = 0; d < dim; d++) {
+        float val = res_row[d];
+
+        // Count how many cutoffs this value exceeds (same as CPU logic)
+        int bucket = 0;
+        for (int c = 0; c < num_cutoffs; c++) {
+            if (val > s_cutoffs[c]) bucket++;
+        }
+
+        // Pack bits into bytes (MSB-first within each byte, matching CPU)
+        for (int b = 0; b < nbits; b++) {
+            int bit = (bucket >> b) & 1;
+            int byte_idx = bit_idx / 8;
+            int bit_pos = 7 - (bit_idx % 8);
+            out_row[byte_idx] |= (unsigned char)(bit << bit_pos);
+            bit_idx++;
+        }
+    }
+}
 "#;
 
 /// Compile and load CUDA kernels, returning the kernel functions.
@@ -238,7 +292,7 @@ extern "C" __global__ void gather_subtract_kernel(
 /// Targets the device's actual compute capability to avoid
 /// `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` when the NVRTC compiler is newer
 /// than the installed driver.
-fn load_kernels(device: &Arc<CudarcContext>) -> Result<(CudaFunction, CudaFunction)> {
+fn load_kernels(device: &Arc<CudarcContext>) -> Result<(CudaFunction, CudaFunction, CudaFunction)> {
     let opts = match device.compute_capability() {
         Ok((major, minor)) => CompileOptions {
             options: vec![format!("--gpu-architecture=sm_{}{}", major, minor)],
@@ -262,7 +316,11 @@ fn load_kernels(device: &Arc<CudarcContext>) -> Result<(CudaFunction, CudaFuncti
         .load_function("gather_subtract_kernel")
         .map_err(|e| Error::Codec(format!("Failed to load gather_subtract_kernel: {:?}", e)))?;
 
-    Ok((argmax_func, gather_subtract_func))
+    let quantize_func = module
+        .load_function("quantize_residuals_kernel")
+        .map_err(|e| Error::Codec(format!("Failed to load quantize_residuals_kernel: {:?}", e)))?;
+
+    Ok((argmax_func, gather_subtract_func, quantize_func))
 }
 
 /// Compute optimal batch size to stay within GPU memory budget.
@@ -576,6 +634,123 @@ pub fn compress_and_residuals_cuda_batched(
     }
 
     Ok((Array1::from_vec(all_codes), all_residuals))
+}
+
+/// CUDA-accelerated residual quantization with memory-efficient batching.
+///
+/// Bucketizes each residual value against cutoffs and bit-packs the result,
+/// matching the CPU `quantize_residuals` logic exactly.
+///
+/// Falls back gracefully via Result — callers should catch errors and use CPU path.
+pub fn quantize_residuals_cuda(
+    ctx: &CudaContext,
+    residuals: &ArrayView2<f32>,
+    bucket_cutoffs: &[f32],
+    nbits: usize,
+) -> Result<ndarray::Array2<u8>> {
+    let n = residuals.nrows();
+    let dim = residuals.ncols();
+    let packed_dim = dim * nbits / 8;
+    let num_cutoffs = bucket_cutoffs.len();
+
+    if n == 0 {
+        return Ok(ndarray::Array2::zeros((0, packed_dim)));
+    }
+
+    let start_time = std::time::Instant::now();
+    eprintln!(
+        "[next-plaid] CUDA quantize_residuals: {} rows x {} dims, nbits={}, {} cutoffs",
+        n, dim, nbits, num_cutoffs
+    );
+
+    // Upload cutoffs (small, shared across all batches)
+    let cutoffs_gpu: CudaSlice<f32> = ctx
+        .stream
+        .clone_htod(bucket_cutoffs)
+        .map_err(|e| Error::Codec(format!("Failed to upload cutoffs to GPU: {:?}", e)))?;
+
+    // Batch to stay within GPU memory
+    // Memory per row: residuals (dim*4) + packed output (packed_dim)
+    let max_mem = DEFAULT_MAX_GPU_MEMORY;
+    let bytes_per_row = dim * 4 + packed_dim;
+    let batch_size = (max_mem / bytes_per_row).clamp(1, n);
+
+    let mut all_packed = ndarray::Array2::<u8>::zeros((n, packed_dim));
+
+    for batch_start in (0..n).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size).min(n);
+        let batch_n = batch_end - batch_start;
+
+        // Get contiguous batch of residuals
+        let batch_residuals = residuals.slice(ndarray::s![batch_start..batch_end, ..]);
+        let residuals_vec: Vec<f32> = batch_residuals.iter().copied().collect();
+
+        // Upload residuals
+        let residuals_gpu: CudaSlice<f32> = ctx
+            .stream
+            .clone_htod(&residuals_vec)
+            .map_err(|e| Error::Codec(format!("Failed to upload residuals batch to GPU: {:?}", e)))?;
+
+        // Allocate output (zeroed)
+        let mut packed_gpu: CudaSlice<u8> = ctx
+            .stream
+            .alloc_zeros(batch_n * packed_dim)
+            .map_err(|e| Error::Codec(format!("Failed to allocate packed output on GPU: {:?}", e)))?;
+
+        // Launch kernel: one thread per row, shared memory for cutoffs
+        let threads_per_block = 256u32.min(batch_n as u32);
+        let num_blocks = ((batch_n as u32) + threads_per_block - 1) / threads_per_block;
+        let shared_mem = num_cutoffs * std::mem::size_of::<f32>();
+
+        let launch_config = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (threads_per_block, 1, 1),
+            shared_mem_bytes: shared_mem as u32,
+        };
+
+        let batch_n_i32 = batch_n as i32;
+        let dim_i32 = dim as i32;
+        let packed_dim_i32 = packed_dim as i32;
+        let nbits_i32 = nbits as i32;
+        let num_cutoffs_i32 = num_cutoffs as i32;
+
+        unsafe {
+            ctx.stream
+                .launch_builder(&ctx.quantize_func)
+                .arg(&residuals_gpu)
+                .arg(&mut packed_gpu)
+                .arg(&cutoffs_gpu)
+                .arg(&batch_n_i32)
+                .arg(&dim_i32)
+                .arg(&packed_dim_i32)
+                .arg(&nbits_i32)
+                .arg(&num_cutoffs_i32)
+                .launch(launch_config)
+                .map_err(|e| Error::Codec(format!("Failed to launch quantize kernel: {:?}", e)))?;
+        }
+
+        // Download result
+        let packed_host: Vec<u8> = ctx
+            .stream
+            .clone_dtoh(&packed_gpu)
+            .map_err(|e| Error::Codec(format!("Failed to download packed data from GPU: {:?}", e)))?;
+
+        // Copy into output array
+        let out_slice = all_packed
+            .slice_mut(ndarray::s![batch_start..batch_end, ..])
+            .into_slice_memory_order()
+            .unwrap();
+        out_slice.copy_from_slice(&packed_host);
+    }
+
+    let elapsed = start_time.elapsed();
+    eprintln!(
+        "[next-plaid] CUDA quantize_residuals completed in {:.1}ms ({} rows)",
+        elapsed.as_secs_f64() * 1000.0,
+        n
+    );
+
+    Ok(all_packed)
 }
 
 #[cfg(test)]
